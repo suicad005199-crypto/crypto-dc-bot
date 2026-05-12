@@ -1,26 +1,19 @@
-# ===========================
-# Discord Bot 設定
-# ===========================
-DISCORD_TOKEN=你的_Discord_Bot_Token
-DISCORD_CHANNEL_ID=你的_頻道_ID
-
-# ===========================
-# 交易所 API 設定（選填，不填則用公開API）
-# ===========================
-BINANCE_API_KEY=
-BINANCE_API_SECRET=
-
-# ===========================
-# 監控設定
-# ===========================
-# 要監控的交易對（逗號分隔），留空則自動偵測前20大
-WATCH_SYMBOLS=BTC/USDT,ETH/USDT,BNB/USDT
-
-# 價格警報閾值（百分比變動）
-ALERT_THRESHOLD=3
-
-# 輪詢間隔（毫秒）
-POLL_INTERVAL=10000
-
-# 使用的交易所: binance | okx | bybit
-EXCHANGE=binance
+{
+  "name": "crypto-dc-bot",
+  "version": "1.0.0",
+  "description": "Discord Bot - 自動偵測幣種即時回報交易標的",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.1",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  }
+}
