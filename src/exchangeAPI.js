@@ -1,218 +1,246 @@
-// src/index.js
-// Discord Bot 主程式 - 幣種自動偵測 + 即時回報
+// src/exchangeAPI.js
+// 交易所 API 模組 - 支援 Binance / OKX / Bybit
 
-require("dotenv").config();
-const { Client, GatewayIntentBits, Events, SlashCommandBuilder, REST, Routes } = require("discord.js");
-const { getExchange } = require("./exchangeAPI");
-const { buildTickerEmbed, buildOverviewEmbed, buildAlertEmbed } = require("./formatter");
+const axios = require("axios");
 
-// ─── 設定 ──────────────────────────────────────────────────
-const TOKEN      = process.env.DISCORD_TOKEN;
-const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
-const EXCHANGE   = process.env.EXCHANGE || "binance";
-const THRESHOLD  = parseFloat(process.env.ALERT_THRESHOLD || "3");
-const INTERVAL   = parseInt(process.env.POLL_INTERVAL || "10000");
-const WATCH_RAW  = process.env.WATCH_SYMBOLS || "";
+// ─── Binance ───────────────────────────────────────────────
+const BinanceAPI = {
+  baseURL: "https://api.binance.com",
 
-const api = getExchange(EXCHANGE);
+  // 自動取得所有 USDT 交易對（依成交量排序）
+  async getTopSymbols(limit = 20) {
+    const res = await axios.get(`${this.baseURL}/api/v3/ticker/24hr`);
+    return res.data
+      .filter((t) => t.symbol.endsWith("USDT"))
+      .sort((a, b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+      .slice(0, limit)
+      .map((t) => t.symbol);
+  },
 
-// ─── Discord Client ────────────────────────────────────────
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
-});
+  // 取得指定交易對資訊
+  async getTicker(symbol) {
+    const sym = symbol.replace("/", ""); // BTC/USDT → BTCUSDT
+    const [ticker, info] = await Promise.all([
+      axios.get(`${this.baseURL}/api/v3/ticker/24hr?symbol=${sym}`),
+      axios.get(`${this.baseURL}/api/v3/exchangeInfo?symbol=${sym}`),
+    ]);
+    const d = ticker.data;
+    const filters = info.data.symbols[0].filters;
+    const lotFilter = filters.find((f) => f.filterType === "LOT_SIZE");
 
-// ─── Slash Commands 定義 ───────────────────────────────────
-const commands = [
-  new SlashCommandBuilder()
-    .setName("price")
-    .setDescription("查詢單一交易對即時資訊")
-    .addStringOption((opt) =>
-      opt.setName("symbol").setDescription("交易對，例如 BTC/USDT").setRequired(true)
-    ),
+    return {
+      exchange: "Binance",
+      symbol: symbol,
+      baseAsset: info.data.symbols[0].baseAsset,
+      quoteAsset: info.data.symbols[0].quoteAsset,
+      type: detectAssetType(info.data.symbols[0].baseAsset),
+      price: parseFloat(d.lastPrice),
+      priceChange: parseFloat(d.priceChangePercent),
+      high24h: parseFloat(d.highPrice),
+      low24h: parseFloat(d.lowPrice),
+      volume24h: parseFloat(d.volume),
+      quoteVolume24h: parseFloat(d.quoteVolume),
+      minQty: lotFilter?.minQty,
+      timestamp: Date.now(),
+    };
+  },
 
-  new SlashCommandBuilder()
-    .setName("market")
-    .setDescription("顯示前 N 大交易對總覽")
-    .addIntegerOption((opt) =>
-      opt.setName("limit").setDescription("顯示幾個（預設 10）").setRequired(false)
-    ),
+  // 批次取得多個交易對
+  async getMultipleTickers(symbols) {
+    const res = await axios.get(`${this.baseURL}/api/v3/ticker/24hr`);
+    const map = {};
+    res.data.forEach((t) => (map[t.symbol] = t));
 
-  new SlashCommandBuilder()
-    .setName("watch")
-    .setDescription("設定自動監控的交易對（逗號分隔）")
-    .addStringOption((opt) =>
-      opt.setName("symbols").setDescription("例如 BTC/USDT,ETH/USDT").setRequired(true)
-    ),
+    return symbols.map((sym) => {
+      const key = sym.replace("/", "");
+      const d = map[key];
+      if (!d) return null;
+      const base = key.replace("USDT", "");
+      return {
+        exchange: "Binance",
+        symbol: sym,
+        baseAsset: base,
+        quoteAsset: "USDT",
+        type: detectAssetType(base),
+        price: parseFloat(d.lastPrice),
+        priceChange: parseFloat(d.priceChangePercent),
+        high24h: parseFloat(d.highPrice),
+        low24h: parseFloat(d.lowPrice),
+        volume24h: parseFloat(d.volume),
+        quoteVolume24h: parseFloat(d.quoteVolume),
+        timestamp: Date.now(),
+      };
+    }).filter(Boolean);
+  },
+};
 
-  new SlashCommandBuilder()
-    .setName("status")
-    .setDescription("顯示目前監控狀態"),
+// ─── OKX ───────────────────────────────────────────────────
+const OKXAPI = {
+  baseURL: "https://www.okx.com",
 
-  new SlashCommandBuilder()
-    .setName("detect")
-    .setDescription("自動偵測交易所前 N 大幣種並開始監控")
-    .addIntegerOption((opt) =>
-      opt.setName("limit").setDescription("偵測幾個（預設 20）").setRequired(false)
-    ),
-].map((cmd) => cmd.toJSON());
+  async getTopSymbols(limit = 20) {
+    const res = await axios.get(
+      `${this.baseURL}/api/v5/market/tickers?instType=SPOT`
+    );
+    return res.data.data
+      .filter((t) => t.instId.endsWith("-USDT"))
+      .sort((a, b) => parseFloat(b.volCcy24h) - parseFloat(a.volCcy24h))
+      .slice(0, limit)
+      .map((t) => t.instId.replace("-", "/"));
+  },
 
-// ─── 狀態管理 ──────────────────────────────────────────────
-let watchSymbols = WATCH_RAW
-  ? WATCH_RAW.split(",").map((s) => s.trim())
-  : [];
-let monitorInterval = null;
-let lastPrices = {};
+  async getTicker(symbol) {
+    const instId = symbol.replace("/", "-"); // BTC/USDT → BTC-USDT
+    const res = await axios.get(
+      `${this.baseURL}/api/v5/market/ticker?instId=${instId}`
+    );
+    const d = res.data.data[0];
+    const base = instId.split("-")[0];
+    return {
+      exchange: "OKX",
+      symbol: symbol,
+      baseAsset: base,
+      quoteAsset: "USDT",
+      type: detectAssetType(base),
+      price: parseFloat(d.last),
+      priceChange: (((parseFloat(d.last) - parseFloat(d.open24h)) / parseFloat(d.open24h)) * 100),
+      high24h: parseFloat(d.high24h),
+      low24h: parseFloat(d.low24h),
+      volume24h: parseFloat(d.vol24h),
+      quoteVolume24h: parseFloat(d.volCcy24h),
+      timestamp: Date.now(),
+    };
+  },
 
-// ─── 監控邏輯 ──────────────────────────────────────────────
-async function startMonitor(channel) {
-  if (monitorInterval) clearInterval(monitorInterval);
+  async getMultipleTickers(symbols) {
+    const res = await axios.get(
+      `${this.baseURL}/api/v5/market/tickers?instType=SPOT`
+    );
+    const map = {};
+    res.data.data.forEach((t) => (map[t.instId] = t));
 
-  console.log(`🚀 開始監控 ${watchSymbols.length} 個交易對...`);
+    return symbols.map((sym) => {
+      const instId = sym.replace("/", "-");
+      const d = map[instId];
+      if (!d) return null;
+      const base = instId.split("-")[0];
+      return {
+        exchange: "OKX",
+        symbol: sym,
+        baseAsset: base,
+        quoteAsset: "USDT",
+        type: detectAssetType(base),
+        price: parseFloat(d.last),
+        priceChange: (((parseFloat(d.last) - parseFloat(d.open24h)) / parseFloat(d.open24h)) * 100),
+        high24h: parseFloat(d.high24h),
+        low24h: parseFloat(d.low24h),
+        volume24h: parseFloat(d.vol24h),
+        quoteVolume24h: parseFloat(d.volCcy24h),
+        timestamp: Date.now(),
+      };
+    }).filter(Boolean);
+  },
+};
 
-  monitorInterval = setInterval(async () => {
-    if (watchSymbols.length === 0) return;
-    try {
-      const tickers = await api.getMultipleTickers(watchSymbols);
-      for (const ticker of tickers) {
-        const absChange = Math.abs(ticker.priceChange);
-        const prevPrice = lastPrices[ticker.symbol];
+// ─── Bybit ─────────────────────────────────────────────────
+const BybitAPI = {
+  baseURL: "https://api.bybit.com",
 
-        // 超過閾值 → 發送警報
-        if (absChange >= THRESHOLD) {
-          const alreadyAlerted = prevPrice?.alerted && Date.now() - prevPrice.alertedAt < 3600000;
-          if (!alreadyAlerted) {
-            await channel.send({ embeds: [buildAlertEmbed(ticker, THRESHOLD)] });
-            lastPrices[ticker.symbol] = { price: ticker.price, alerted: true, alertedAt: Date.now() };
-          }
-        } else {
-          lastPrices[ticker.symbol] = { price: ticker.price, alerted: false };
-        }
-      }
-      console.log(`[${new Date().toLocaleTimeString()}] 已掃描 ${tickers.length} 個交易對`);
-    } catch (err) {
-      console.error("監控錯誤:", err.message);
-    }
-  }, INTERVAL);
+  async getTopSymbols(limit = 20) {
+    const res = await axios.get(
+      `${this.baseURL}/v5/market/tickers?category=spot`
+    );
+    return res.data.result.list
+      .filter((t) => t.symbol.endsWith("USDT"))
+      .sort((a, b) => parseFloat(b.turnover24h) - parseFloat(a.turnover24h))
+      .slice(0, limit)
+      .map((t) => t.symbol.replace("USDT", "/USDT"));
+  },
+
+  async getTicker(symbol) {
+    const sym = symbol.replace("/", "");
+    const res = await axios.get(
+      `${this.baseURL}/v5/market/tickers?category=spot&symbol=${sym}`
+    );
+    const d = res.data.result.list[0];
+    const base = sym.replace("USDT", "");
+    return {
+      exchange: "Bybit",
+      symbol: symbol,
+      baseAsset: base,
+      quoteAsset: "USDT",
+      type: detectAssetType(base),
+      price: parseFloat(d.lastPrice),
+      priceChange: parseFloat(d.price24hPcnt) * 100,
+      high24h: parseFloat(d.highPrice24h),
+      low24h: parseFloat(d.lowPrice24h),
+      volume24h: parseFloat(d.volume24h),
+      quoteVolume24h: parseFloat(d.turnover24h),
+      timestamp: Date.now(),
+    };
+  },
+
+  async getMultipleTickers(symbols) {
+    const res = await axios.get(
+      `${this.baseURL}/v5/market/tickers?category=spot`
+    );
+    const map = {};
+    res.data.result.list.forEach((t) => (map[t.symbol] = t));
+
+    return symbols.map((sym) => {
+      const key = sym.replace("/", "");
+      const d = map[key];
+      if (!d) return null;
+      const base = key.replace("USDT", "");
+      return {
+        exchange: "Bybit",
+        symbol: sym,
+        baseAsset: base,
+        quoteAsset: "USDT",
+        type: detectAssetType(base),
+        price: parseFloat(d.lastPrice),
+        priceChange: parseFloat(d.price24hPcnt) * 100,
+        high24h: parseFloat(d.highPrice24h),
+        low24h: parseFloat(d.lowPrice24h),
+        volume24h: parseFloat(d.volume24h),
+        quoteVolume24h: parseFloat(d.turnover24h),
+        timestamp: Date.now(),
+      };
+    }).filter(Boolean);
+  },
+};
+
+// ─── 自動偵測資產類型 ──────────────────────────────────────
+const ASSET_CATEGORIES = {
+  // Layer 1
+  L1: ["BTC", "ETH", "BNB", "SOL", "ADA", "AVAX", "DOT", "ATOM", "NEAR", "FTM", "ALGO", "ONE", "EGLD", "HBAR", "XLM", "XRP", "TRX", "MATIC", "APT", "SUI"],
+  // Layer 2
+  L2: ["ARB", "OP", "MATIC", "IMX", "METIS", "BOBA", "ZKS", "STRK", "MANTA", "BLAST"],
+  // DeFi
+  DEFI: ["UNI", "AAVE", "COMP", "MKR", "CRV", "SUSHI", "YFI", "SNX", "BAL", "1INCH", "DYDX", "GMX", "GNS", "PENDLE", "JOE"],
+  // Meme
+  MEME: ["DOGE", "SHIB", "PEPE", "FLOKI", "BONK", "WIF", "MEME", "BOME", "POPCAT", "MEW"],
+  // AI
+  AI: ["FET", "AGIX", "OCEAN", "RNDR", "TAO", "ARKM", "GRT", "NMR", "WLD"],
+  // GameFi
+  GAMEFI: ["AXS", "SAND", "MANA", "ENJ", "GALA", "ILV", "GMT", "STEPN", "MAGIC", "IMX"],
+  // Stablecoin
+  STABLE: ["USDT", "USDC", "BUSD", "DAI", "TUSD", "FRAX", "LUSD"],
+};
+
+function detectAssetType(baseAsset) {
+  const asset = baseAsset.toUpperCase();
+  for (const [type, list] of Object.entries(ASSET_CATEGORIES)) {
+    if (list.includes(asset)) return type;
+  }
+  return "ALT"; // 其他山寨幣
 }
 
-// ─── Bot 啟動 ──────────────────────────────────────────────
-client.once(Events.ClientReady, async (c) => {
-  console.log(`✅ Bot 已上線：${c.user.tag}`);
+// ─── 匯出 ──────────────────────────────────────────────────
+const EXCHANGES = { binance: BinanceAPI, okx: OKXAPI, bybit: BybitAPI };
 
-  // 註冊 Slash Commands
-  const rest = new REST({ version: "10" }).setToken(TOKEN);
-  try {
-    await rest.put(Routes.applicationCommands(c.user.id), { body: commands });
-    console.log("✅ Slash Commands 已註冊");
-  } catch (err) {
-    console.error("Slash Commands 註冊失敗:", err);
-  }
-
-  // 自動偵測（若沒有設定 WATCH_SYMBOLS）
-  if (watchSymbols.length === 0) {
-    console.log("🔍 未設定監控清單，自動偵測前 20 大幣種...");
-    try {
-      watchSymbols = await api.getTopSymbols(20);
-      console.log("✅ 自動偵測完成:", watchSymbols.join(", "));
-    } catch (err) {
-      console.error("自動偵測失敗:", err.message);
-    }
-  }
-
-  // 開始監控
-  const channel = await c.channels.fetch(CHANNEL_ID).catch(() => null);
-  if (channel) {
-    await startMonitor(channel);
-    await channel.send({
-      embeds: [
-        buildOverviewEmbed(
-          await api.getMultipleTickers(watchSymbols.slice(0, 15)),
-          EXCHANGE
-        ),
-      ],
-    });
-  } else {
-    console.warn("⚠️ 找不到頻道，請確認 DISCORD_CHANNEL_ID");
-  }
-});
-
-// ─── Slash Command 處理 ────────────────────────────────────
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-  await interaction.deferReply();
-
-  try {
-    switch (interaction.commandName) {
-
-      // /price BTC/USDT
-      case "price": {
-        const sym = interaction.options.getString("symbol").toUpperCase();
-        const ticker = await api.getTicker(sym);
-        await interaction.editReply({ embeds: [buildTickerEmbed(ticker)] });
-        break;
-      }
-
-      // /market [limit]
-      case "market": {
-        const limit = interaction.options.getInteger("limit") || 10;
-        const symbols = await api.getTopSymbols(limit);
-        const tickers = await api.getMultipleTickers(symbols);
-        await interaction.editReply({ embeds: [buildOverviewEmbed(tickers, EXCHANGE)] });
-        break;
-      }
-
-      // /watch BTC/USDT,ETH/USDT
-      case "watch": {
-        const input = interaction.options.getString("symbols");
-        watchSymbols = input.split(",").map((s) => s.trim().toUpperCase());
-        lastPrices = {};
-        const channel = interaction.channel;
-        await startMonitor(channel);
-        await interaction.editReply(
-          `✅ 已設定監控：**${watchSymbols.join(", ")}**\n每 ${INTERVAL / 1000} 秒掃描一次，漲跌超過 ${THRESHOLD}% 自動警報`
-        );
-        break;
-      }
-
-      // /status
-      case "status": {
-        const statusText =
-          `**📡 目前監控狀態**\n` +
-          `• 交易所：${EXCHANGE}\n` +
-          `• 監控標的：${watchSymbols.length > 0 ? watchSymbols.join(", ") : "無"}\n` +
-          `• 掃描間隔：${INTERVAL / 1000} 秒\n` +
-          `• 警報閾值：±${THRESHOLD}%\n` +
-          `• 監控中：${monitorInterval ? "✅ 是" : "❌ 否"}`;
-        await interaction.editReply(statusText);
-        break;
-      }
-
-      // /detect [limit]
-      case "detect": {
-        const limit = interaction.options.getInteger("limit") || 20;
-        await interaction.editReply(`🔍 正在自動偵測 ${EXCHANGE} 前 ${limit} 大幣種...`);
-        watchSymbols = await api.getTopSymbols(limit);
-        lastPrices = {};
-        const channel = interaction.channel;
-        await startMonitor(channel);
-        const tickers = await api.getMultipleTickers(watchSymbols.slice(0, 15));
-        await interaction.followUp({
-          content: `✅ 已偵測並開始監控 **${watchSymbols.length}** 個交易對`,
-          embeds: [buildOverviewEmbed(tickers, EXCHANGE)],
-        });
-        break;
-      }
-    }
-  } catch (err) {
-    console.error(`指令錯誤 [${interaction.commandName}]:`, err.message);
-    await interaction.editReply(`❌ 發生錯誤：${err.message}`);
-  }
-});
-
-// ─── 啟動 ──────────────────────────────────────────────────
-if (!TOKEN) {
-  console.error("❌ 請在 .env 設定 DISCORD_TOKEN");
-  process.exit(1);
+function getExchange(name = "binance") {
+  return EXCHANGES[name.toLowerCase()] || BinanceAPI;
 }
 
-client.login(TOKEN);
+module.exports = { getExchange, detectAssetType, ASSET_CATEGORIES };
