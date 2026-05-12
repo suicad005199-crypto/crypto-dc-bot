@@ -1,0 +1,21 @@
+services:
+  - type: worker
+    name: crypto-dc-bot
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeploy: true
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_CHANNEL_ID
+        sync: false
+      - key: EXCHANGE
+        value: okx
+      - key: ALERT_THRESHOLD
+        value: "3"
+      - key: POLL_INTERVAL
+        value: "10000"
+      - key: WATCH_SYMBOLS
+        sync: false
