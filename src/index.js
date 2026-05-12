@@ -1,4 +1,3 @@
-// src/index.js
 require("dotenv").config();
 
 console.log("🚀 Bot 程式啟動中...");
@@ -17,61 +16,36 @@ const THRESHOLD  = parseFloat(process.env.ALERT_THRESHOLD || "3");
 const INTERVAL   = parseInt(process.env.POLL_INTERVAL || "10000");
 const WATCH_RAW  = process.env.WATCH_SYMBOLS || "";
 
-if (!TOKEN) {
-  console.error("❌ 錯誤：DISCORD_TOKEN 未設定！");
-  process.exit(1);
-}
-
-if (!CHANNEL_ID) {
-  console.error("❌ 錯誤：DISCORD_CHANNEL_ID 未設定！");
+if (!TOKEN || !CHANNEL_ID) {
+  console.error("❌ 錯誤：必要環境變數 (TOKEN 或 CHANNEL_ID) 缺失！");
   process.exit(1);
 }
 
 const api = getExchange(EXCHANGE);
-console.log("📡 使用交易所:", EXCHANGE);
-
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+  ],
 });
 
-const commands = [
-  new SlashCommandBuilder()
-    .setName("price")
-    .setDescription("查詢單一交易對即時資訊")
-    .addStringOption((opt) =>
-      opt.setName("symbol").setDescription("交易對，例如 BTC/USDT").setRequired(true)
-    ),
-  new SlashCommandBuilder()
-    .setName("market")
-    .setDescription("顯示前 N 大交易對總覽")
-    .addIntegerOption((opt) =>
-      opt.setName("limit").setDescription("顯示幾個（預設 10）").setRequired(false)
-    ),
-  new SlashCommandBuilder()
-    .setName("watch")
-    .setDescription("設定自動監控的交易對（逗號分隔）")
-    .addStringOption((opt) =>
-      opt.setName("symbols").setDescription("例如 BTC/USDT,ETH/USDT").setRequired(true)
-    ),
-  new SlashCommandBuilder()
-    .setName("status")
-    .setDescription("顯示目前監控狀態"),
-  new SlashCommandBuilder()
-    .setName("detect")
-    .setDescription("自動偵測交易所前 N 大幣種並開始監控")
-    .addIntegerOption((opt) =>
-      opt.setName("limit").setDescription("偵測幾個（預設 20）").setRequired(false)
-    ),
-].map((cmd) => cmd.toJSON());
-
-let watchSymbols = WATCH_RAW ? WATCH_RAW.split(",").map((s) => s.trim()) : [];
+let watchSymbols = WATCH_RAW ? WATCH_RAW.split(",").map((s) => s.trim().toUpperCase()) : [];
 let monitorInterval = null;
 let lastPrices = {};
 
-async function startMonitor(channel) {
-  if (monitorInterval) clearInterval(monitorInterval);
-  console.log(`🚀 開始監控 ${watchSymbols.length} 個交易對...`);
+const commands = [
+  new SlashCommandBuilder().setName("price").setDescription("查詢單一交易對即時資訊").addStringOption(o => o.setName("symbol").setDescription("例如 BTC/USDT").setRequired(true)),
+  new SlashCommandBuilder().setName("market").setDescription("顯示前 N 大交易對總覽").addIntegerOption(o => o.setName("limit").setDescription("預設 10")),
+  new SlashCommandBuilder().setName("watch").setDescription("設定監控交易對").addStringOption(o => o.setName("symbols").setDescription("逗號分隔").setRequired(true)),
+  new SlashCommandBuilder().setName("status").setDescription("目前監控狀態"),
+  new SlashCommandBuilder().setName("detect").setDescription("自動偵測前 N 大幣種").addIntegerOption(o => o.setName("limit").setDescription("預設 20")),
+].map(cmd => cmd.toJSON());
 
+async function startMonitor(channel) {
+  if (!channel) return console.error("❌ 啟動監控失敗：頻道物件無效");
+  if (monitorInterval) clearInterval(monitorInterval);
+  
+  console.log(`🚀 開始監控 ${watchSymbols.length} 個交易對...`);
   monitorInterval = setInterval(async () => {
     if (watchSymbols.length === 0) return;
     try {
@@ -79,25 +53,32 @@ async function startMonitor(channel) {
       for (const ticker of tickers) {
         const absChange = Math.abs(ticker.priceChange);
         const prevPrice = lastPrices[ticker.symbol];
+        
         if (absChange >= THRESHOLD) {
-          const alreadyAlerted = prevPrice?.alerted && Date.now() - prevPrice.alertedAt < 3600000;
+          const alreadyAlerted = prevPrice?.alerted && (Date.now() - prevPrice.alertedAt < 3600000);
           if (!alreadyAlerted) {
-            await channel.send({ embeds: [buildAlertEmbed(ticker, THRESHOLD)] });
+            await channel.send({ embeds: [buildAlertEmbed(ticker, THRESHOLD)] }).catch(e => console.error("發送警報失敗:", e.message));
             lastPrices[ticker.symbol] = { price: ticker.price, alerted: true, alertedAt: Date.now() };
           }
         } else {
           lastPrices[ticker.symbol] = { price: ticker.price, alerted: false };
         }
       }
-      console.log(`[${new Date().toLocaleTimeString()}] 掃描完成 ${tickers.length} 個交易對`);
     } catch (err) {
-      console.error("監控錯誤:", err.message);
+      console.error("監控掃描錯誤:", err.message);
     }
   }, INTERVAL);
 }
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`✅ Bot 已上線：${c.user.tag}`);
+
+  // --- 除錯用：列出 Bot 看得到的所有頻道 ---
+  console.log("--- 頻道檢索中 ---");
+  const visibleChannels = c.channels.cache.filter(ch => ch.isTextBased());
+  console.log(`Bot 總共可以看到 ${visibleChannels.size} 個文字頻道`);
+  visibleChannels.forEach(ch => console.log(`> 頻道: ${ch.name} | ID: ${ch.id} | 伺服器: ${ch.guild.name}`));
+  console.log("------------------");
 
   const rest = new REST({ version: "10" }).setToken(TOKEN);
   try {
@@ -107,26 +88,29 @@ client.once(Events.ClientReady, async (c) => {
     console.error("Slash Commands 註冊失敗:", err.message);
   }
 
+  // 初始化監控對象
   if (watchSymbols.length === 0) {
-    console.log("🔍 自動偵測前 20 大幣種...");
     try {
       watchSymbols = await api.getTopSymbols(20);
-      console.log("✅ 偵測完成:", watchSymbols.slice(0, 5).join(", "), "...");
-    } catch (err) {
-      console.error("自動偵測失敗:", err.message);
-    }
+      console.log("✅ 自動偵測幣種完成");
+    } catch (e) { console.error("偵測失敗:", e.message); }
   }
 
+  // 嘗試獲取頻道並發送啟動訊息
   try {
     const channel = await c.channels.fetch(CHANNEL_ID);
-    console.log("✅ 頻道找到:", channel.name);
+    console.log(`✅ 成功對接頻道：#${channel.name}`);
+    
     await startMonitor(channel);
-
-    const tickers = await api.getMultipleTickers(watchSymbols.slice(0, 15));
-    await channel.send({ embeds: [buildOverviewEmbed(tickers, EXCHANGE)] });
-    console.log("✅ 市場總覽已發送！");
+    
+    const initialTickers = await api.getMultipleTickers(watchSymbols.slice(0, 15));
+    await channel.send({ 
+      content: "🔔 **加密貨幣監控機器人已啟動**",
+      embeds: [buildOverviewEmbed(initialTickers, EXCHANGE)] 
+    });
   } catch (err) {
-    console.error("❌ 頻道錯誤:", err.message);
+    console.error(`❌ 頻道錯誤 (${CHANNEL_ID}): ${err.message}`);
+    console.error("請確認：1. ID 是否正確 2. Bot 是否已被邀請入伺服器 3. Bot 是否有查看該頻道的權限");
   }
 });
 
@@ -151,16 +135,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       case "watch": {
         const input = interaction.options.getString("symbols");
-        watchSymbols = input.split(",").map((s) => s.trim().toUpperCase());
+        watchSymbols = input.split(",").map(s => s.trim().toUpperCase());
         lastPrices = {};
         await startMonitor(interaction.channel);
-        await interaction.editReply(`✅ 已設定監控：**${watchSymbols.join(", ")}**`);
+        await interaction.editReply(`✅ 監控清單更新：**${watchSymbols.join(", ")}**`);
         break;
       }
       case "status": {
-        await interaction.editReply(
-          `**📡 監控狀態**\n• 交易所：${EXCHANGE}\n• 標的：${watchSymbols.join(", ") || "無"}\n• 間隔：${INTERVAL/1000}秒\n• 閾值：±${THRESHOLD}%`
-        );
+        await interaction.editReply(`**📡 狀態報告**\n• 交易所: ${EXCHANGE}\n• 監控中: ${watchSymbols.length} 個交易對\n• 警報閾值: ±${THRESHOLD}%`);
         break;
       }
       case "detect": {
@@ -168,30 +150,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
         watchSymbols = await api.getTopSymbols(limit);
         lastPrices = {};
         await startMonitor(interaction.channel);
-        const tickers = await api.getMultipleTickers(watchSymbols.slice(0, 15));
-        await interaction.editReply({
-          content: `✅ 偵測並監控 **${watchSymbols.length}** 個交易對`,
-          embeds: [buildOverviewEmbed(tickers, EXCHANGE)],
-        });
+        await interaction.editReply(`✅ 已重新偵測前 ${limit} 大交易對並開始監控`);
         break;
       }
     }
   } catch (err) {
-    console.error(`指令錯誤 [${interaction.commandName}]:`, err.message);
-    await interaction.editReply(`❌ 錯誤：${err.message}`);
+    console.error(`指令處理失敗 [${interaction.commandName}]:`, err.message);
+    await interaction.editReply(`❌ 執行失敗：${err.message}`);
   }
 });
 
-client.on("error", (err) => {
-  console.error("❌ Discord 客戶端錯誤:", err.message);
-});
+process.on("unhandledRejection", (err) => console.error("❌ 全域錯誤:", err));
 
-process.on("unhandledRejection", (err) => {
-  console.error("❌ 未處理的錯誤:", err.message);
-});
-
-console.log("🔐 嘗試登入 Discord...");
-client.login(TOKEN).catch((err) => {
-  console.error("❌ 登入失敗:", err.message);
+client.login(TOKEN).catch(e => {
+  console.error("❌ 登入失敗:", e.message);
   process.exit(1);
 });
