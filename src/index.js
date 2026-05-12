@@ -8,6 +8,7 @@ const {
   REST,
   Routes,
   ActivityType,
+  EmbedBuilder,
 } = require("discord.js");
 
 const { getExchange } = require("./exchangeAPI");
@@ -15,13 +16,12 @@ const { scanMarket } = require("./strategy");
 
 const {
   buildTickerEmbed,
-  buildOverviewEmbed,
   buildSignalEmbed,
   buildSignalListEmbed,
 } = require("./formatter");
 
 /* ---------------------------------- */
-/* ENV */
+/* CONFIG（優化結構） */
 /* ---------------------------------- */
 
 const CONFIG = {
@@ -30,507 +30,330 @@ const CONFIG = {
 
   exchange: process.env.EXCHANGE || "okx",
 
-  pollInterval: Number(
-    process.env.POLL_INTERVAL || 300000
-  ),
+  pollInterval: Number(process.env.POLL_INTERVAL || 300000),
+  scanLimit: Number(process.env.SCAN_LIMIT || 30),
 
-  scanLimit: Number(
-    process.env.SCAN_LIMIT || 30
-  ),
-
-  signalMinScore: Number(
-    process.env.SIGNAL_MIN_SCORE || 68
-  ),
-
-  signalMaxResults: Number(
-    process.env.SIGNAL_MAX_RESULTS || 5
-  ),
-
-  signalTimeframe:
-    process.env.SIGNAL_TIMEFRAME || "15m",
-
-  signalHigherTimeframe:
-    process.env.SIGNAL_HIGHER_TIMEFRAME || "1h",
-
-  signalCooldown: Number(
-    process.env.SIGNAL_COOLDOWN || 3600000
-  ),
+  signal: {
+    minScore: Number(process.env.SIGNAL_MIN_SCORE || 68),
+    maxResults: Number(process.env.SIGNAL_MAX_RESULTS || 5),
+    timeframe: process.env.SIGNAL_TIMEFRAME || "15m",
+    higherTimeframe: process.env.SIGNAL_HIGHER_TIMEFRAME || "1h",
+    cooldown: Number(process.env.SIGNAL_COOLDOWN || 3600000),
+  },
 };
 
 if (!CONFIG.token || !CONFIG.channelId) {
-  console.error(
-    "Missing DISCORD_TOKEN or DISCORD_CHANNEL_ID"
-  );
-
+  console.error("Missing DISCORD_TOKEN or DISCORD_CHANNEL_ID");
   process.exit(1);
 }
 
 /* ---------------------------------- */
-/* Discord Client */
+/* CLIENT */
 /* ---------------------------------- */
 
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
 });
 
 const api = getExchange(CONFIG.exchange);
 
-/* ---------------------------------- */
-/* Runtime State */
-/* ---------------------------------- */
-
 let scannerTimer = null;
-
 const signalCooldowns = new Map();
 
-const runtime = {
-  lastScanAt: null,
-  lastSignals: 0,
-  totalSignals: 0,
+/* ---------------------------------- */
+/* CACHE（效能優化） */
+/* ---------------------------------- */
+
+let tickerCache = {
+  data: null,
+  updatedAt: 0,
+  ttl: 15000,
 };
 
+async function getCachedTickers(symbols) {
+  const now = Date.now();
+
+  if (!tickerCache.data || now - tickerCache.updatedAt > tickerCache.ttl) {
+    tickerCache.data = await api.getMultipleTickers(symbols);
+    tickerCache.updatedAt = now;
+  }
+
+  return tickerCache.data;
+}
+
 /* ---------------------------------- */
-/* Commands */
+/* COMMANDS */
 /* ---------------------------------- */
 
 const commands = [
   new SlashCommandBuilder()
-    .setName("price")
-    .setDescription("查詢合約行情")
-    .addStringOption((option) =>
-      option
-        .setName("symbol")
-        .setDescription("例如 BTC/USDT")
+    .setName("市場")
+    .setDescription("強勢幣排行（價格+量能）")
+    .addIntegerOption(o =>
+      o.setName("數量").setDescription("預設10")
+    ),
+
+  new SlashCommandBuilder()
+    .setName("價格")
+    .setDescription("H1趨勢 + M15進場分析")
+    .addStringOption(o =>
+      o.setName("幣種")
+        .setDescription("BTC/USDT")
         .setRequired(true)
     ),
 
   new SlashCommandBuilder()
-    .setName("market")
-    .setDescription("市場總覽")
-    .addIntegerOption((option) =>
-      option
-        .setName("limit")
-        .setDescription("預設 10，最大 30")
+    .setName("訊號")
+    .setDescription("策略掃描交易訊號")
+    .addIntegerOption(o =>
+      o.setName("數量").setDescription("掃描範圍")
     ),
 
   new SlashCommandBuilder()
-    .setName("signals")
-    .setDescription("手動掃描策略訊號")
-    .addIntegerOption((option) =>
-      option
-        .setName("limit")
-        .setDescription("掃描前 N 大合約")
-    ),
-
-  new SlashCommandBuilder()
-    .setName("status")
-    .setDescription("查看掃描器狀態"),
-
-  new SlashCommandBuilder()
-    .setName("ping")
-    .setDescription("查看機器人延遲"),
-].map((command) => command.toJSON());
+    .setName("狀態")
+    .setDescription("系統狀態"),
+].map(c => c.toJSON());
 
 /* ---------------------------------- */
-/* Helpers */
+/* HELPERS */
 /* ---------------------------------- */
 
 function log(...args) {
-  console.log(
-    `[${new Date().toISOString()}]`,
-    ...args
-  );
-}
-
-function scannerOptions(overrides = {}) {
-  return {
-    scanLimit: CONFIG.scanLimit,
-    minScore: CONFIG.signalMinScore,
-    maxSignals: CONFIG.signalMaxResults,
-    timeframe: CONFIG.signalTimeframe,
-    higherTimeframe:
-      CONFIG.signalHigherTimeframe,
-
-    ...overrides,
-  };
+  console.log(`[${new Date().toISOString()}]`, ...args);
 }
 
 function cooldownKey(signal) {
-  return [
-    signal.exchange,
-    signal.symbol,
-    signal.direction,
-  ].join(":");
+  return `${signal.exchange}:${signal.symbol}:${signal.direction}`;
 }
 
-function isSignalCoolingDown(signal) {
+function isCooling(signal) {
   const key = cooldownKey(signal);
-
-  const lastSent =
-    signalCooldowns.get(key) || 0;
-
-  return (
-    Date.now() - lastSent <
-    CONFIG.signalCooldown
-  );
+  const last = signalCooldowns.get(key) || 0;
+  return Date.now() - last < CONFIG.signal.cooldown;
 }
 
-function markSignalCooldown(signal) {
-  signalCooldowns.set(
-    cooldownKey(signal),
-    Date.now()
-  );
+function markCooldown(signal) {
+  signalCooldowns.set(cooldownKey(signal), Date.now());
 }
 
-function filterFreshSignals(signals) {
-  return signals.filter((signal) => {
-    if (isSignalCoolingDown(signal)) {
-      return false;
-    }
+/* ---------------------------------- */
+/* STRATEGY RUNNER */
+/* ---------------------------------- */
 
-    markSignalCooldown(signal);
-
-    return true;
+async function runScan(channel, manual = false, overrides = {}) {
+  const signals = await scanMarket(api, {
+    scanLimit: CONFIG.scanLimit,
+    minScore: CONFIG.signal.minScore,
+    maxSignals: CONFIG.signal.maxResults,
+    timeframe: CONFIG.signal.timeframe,
+    higherTimeframe: CONFIG.signal.higherTimeframe,
+    ...overrides,
   });
-}
 
-async function safeSend(channel, payload) {
-  try {
-    return await channel.send(payload);
-  } catch (err) {
-    log("send failed:", err.message);
-  }
-}
-
-async function updateBotPresence() {
-  try {
-    client.user.setPresence({
-      activities: [
-        {
-          name: `${api.name} Signals`,
-          type: ActivityType.Watching,
-        },
-      ],
-
-      status: "online",
-    });
-  } catch (err) {
-    log("presence update failed:", err.message);
-  }
-}
-
-/* ---------------------------------- */
-/* Strategy Scanner */
-/* ---------------------------------- */
-
-async function runStrategyScan(
-  channel,
-  {
-    manual = false,
-    overrides = {},
-  } = {}
-) {
-  const signals = await scanMarket(
-    api,
-    scannerOptions(overrides)
-  );
-
-  runtime.lastScanAt = Date.now();
-  runtime.lastSignals = signals.length;
-  runtime.totalSignals += signals.length;
-
-  const finalSignals = manual
+  const filtered = manual
     ? signals
-    : filterFreshSignals(signals);
+    : signals.filter(s => {
+        if (isCooling(s)) return false;
+        markCooldown(s);
+        return true;
+      });
 
   if (manual) {
-    await safeSend(channel, {
-      embeds: [
-        buildSignalListEmbed(
-          finalSignals,
-          api.name
-        ),
-      ],
-    });
-
-    return finalSignals;
-  }
-
-  for (const signal of finalSignals) {
-    await safeSend(channel, {
-      embeds: [buildSignalEmbed(signal)],
+    return channel.send({
+      embeds: [buildSignalListEmbed(filtered, api.name)],
     });
   }
 
-  if (finalSignals.length > 0) {
-    log(
-      `sent ${finalSignals.length} signals`
-    );
+  for (const s of filtered) {
+    await channel.send({
+      embeds: [buildSignalEmbed(s)],
+    });
   }
 
-  return finalSignals;
+  return filtered;
 }
 
+/* ---------------------------------- */
+/* SCANNER LOOP */
+/* ---------------------------------- */
+
 async function startScanner(channel) {
-  if (scannerTimer) {
-    clearInterval(scannerTimer);
-  }
+  if (scannerTimer) clearInterval(scannerTimer);
 
-  log(
-    `scanner started | ${api.name} | ${CONFIG.signalHigherTimeframe} -> ${CONFIG.signalTimeframe}`
-  );
+  log(`scanner start: ${api.name}`);
 
-  await runStrategyScan(channel).catch(
-    (err) => {
-      log(
-        "initial scan failed:",
-        err.message
-      );
-    }
+  await runScan(channel).catch(err =>
+    log("initial scan error:", err.message)
   );
 
   scannerTimer = setInterval(async () => {
     try {
-      await runStrategyScan(channel);
-    } catch (err) {
-      log(
-        "scheduled scan failed:",
-        err.message
-      );
+      await runScan(channel);
+    } catch (e) {
+      log("scan error:", e.message);
     }
   }, CONFIG.pollInterval);
 }
 
 /* ---------------------------------- */
-/* Discord Ready */
+/* READY */
 /* ---------------------------------- */
 
-client.once(
-  Events.ClientReady,
-  async (bot) => {
-    log(`bot online: ${bot.user.tag}`);
+client.once(Events.ClientReady, async (bot) => {
+  log(`online: ${bot.user.tag}`);
 
-    await updateBotPresence();
+  const rest = new REST({ version: "10" }).setToken(CONFIG.token);
 
-    try {
-      const rest = new REST({
-        version: "10",
-      }).setToken(CONFIG.token);
+  await rest.put(
+    Routes.applicationCommands(bot.user.id),
+    { body: commands }
+  );
 
-      await rest.put(
-        Routes.applicationCommands(
-          bot.user.id
-        ),
-        {
-          body: commands,
-        }
-      );
+  const channel = await bot.channels.fetch(CONFIG.channelId);
 
-      log("slash commands registered");
-    } catch (err) {
-      log(
-        "slash registration failed:",
-        err.message
-      );
-    }
+  await channel.send(
+    `🚀 Bot啟動｜${api.name}｜H1→M15策略`
+  );
 
-    try {
-      const channel =
-        await bot.channels.fetch(
-          CONFIG.channelId
-        );
-
-      await safeSend(channel, {
-        content: [
-          "🚀 策略掃描器已啟動",
-          `交易所: ${api.name}`,
-          `結構: ${CONFIG.signalHigherTimeframe} → ${CONFIG.signalTimeframe}`,
-          `掃描範圍: Top ${CONFIG.scanLimit}`,
-          `訊號門檻: ${CONFIG.signalMinScore}`,
-        ].join("\n"),
-      });
-
-      await startScanner(channel);
-    } catch (err) {
-      log(
-        "channel init failed:",
-        err.message
-      );
-    }
-  }
-);
+  await startScanner(channel);
+});
 
 /* ---------------------------------- */
-/* Interaction Handler */
+/* COMMAND HANDLER */
 /* ---------------------------------- */
 
-client.on(
-  Events.InteractionCreate,
-  async (interaction) => {
-    if (!interaction.isChatInputCommand()) {
-      return;
-    }
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
 
-    await interaction.deferReply();
+  await interaction.deferReply();
 
-    try {
-      switch (interaction.commandName) {
-        /* ---------------- PRICE ---------------- */
+  try {
 
-        case "price": {
-          const symbol =
-            interaction.options
-              .getString("symbol")
-              .toUpperCase();
-
-          const ticker =
-            await api.getTicker(symbol);
-
-          return interaction.editReply({
-            embeds: [
-              buildTickerEmbed(ticker),
-            ],
-          });
-        }
-
-        /* ---------------- MARKET ---------------- */
-
-        case "market": {
-          const limit = Math.min(
-            interaction.options.getInteger(
-              "limit"
-            ) || 10,
-            30
-          );
-
-          const symbols =
-            await api.getTopSymbols(limit);
-
-          const tickers =
-            await api.getMultipleTickers(
-              symbols
-            );
-
-          return interaction.editReply({
-            embeds: [
-              buildOverviewEmbed(
-                tickers,
-                api.name
-              ),
-            ],
-          });
-        }
-
-        /* ---------------- SIGNALS ---------------- */
-
-        case "signals": {
-          const limit = Math.min(
-            interaction.options.getInteger(
-              "limit"
-            ) || CONFIG.scanLimit,
-            50
-          );
-
-          await interaction.editReply(
-            `🔍 正在掃描 ${api.name} Top ${limit} Contracts...`
-          );
-
-          const signals =
-            await scanMarket(
-              api,
-              scannerOptions({
-                scanLimit: limit,
-              })
-            );
-
-          return interaction.followUp({
-            embeds: [
-              buildSignalListEmbed(
-                signals,
-                api.name
-              ),
-            ],
-          });
-        }
-
-        /* ---------------- STATUS ---------------- */
-
-        case "status": {
-          const uptime = Math.floor(
-            process.uptime()
-          );
-
-          return interaction.editReply({
-            content: [
-              "# 📡 策略掃描器狀態",
-              "",
-              `交易所: ${api.name}`,
-              `大週期: ${CONFIG.signalHigherTimeframe}`,
-              `小週期: ${CONFIG.signalTimeframe}`,
-              `掃描範圍: Top ${CONFIG.scanLimit}`,
-              `分數門檻: ${CONFIG.signalMinScore}`,
-              `掃描間隔: ${
-                CONFIG.pollInterval / 1000
-              } 秒`,
-              `冷卻時間: ${
-                CONFIG.signalCooldown / 60000
-              } 分鐘`,
-              "",
-              `上次掃描訊號: ${runtime.lastSignals}`,
-              `累積訊號數: ${runtime.totalSignals}`,
-              `運行時間: ${uptime} 秒`,
-            ].join("\n"),
-          });
-        }
-
-        /* ---------------- PING ---------------- */
-
-        case "ping": {
-          return interaction.editReply(
-            `🏓 ${client.ws.ping}ms`
-          );
-        }
-      }
-    } catch (err) {
-      log(
-        `command failed [${interaction.commandName}]`,
-        err
+    /* -------- 市場 -------- */
+    if (interaction.commandName === "市場") {
+      const limit = Math.min(
+        interaction.options.getInteger("數量") || 10,
+        30
       );
+
+      const symbols = await api.getTopContractSymbols(100);
+      const tickers = await getCachedTickers(symbols);
+
+      const sorted = tickers
+        .sort((a, b) =>
+          (b.priceChange * 0.7 + b.quoteVolume24h / 1e6) -
+          (a.priceChange * 0.7 + a.quoteVolume24h / 1e6)
+        )
+        .slice(0, limit);
 
       return interaction.editReply({
-        content: `❌ 執行失敗: ${err.message}`,
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0x22c55e)
+            .setTitle("📊 市場強勢排行")
+            .setDescription(
+              sorted.map((t, i) =>
+                `**${i + 1}. ${t.symbol}**
+📈 ${t.priceChange.toFixed(2)}%
+💰 ${t.price}`
+              ).join("\n\n")
+            )
+        ]
       });
     }
+
+    /* -------- 價格 -------- */
+    if (interaction.commandName === "價格") {
+      const symbol = interaction.options.getString("幣種").toUpperCase();
+
+      const [ticker, m15, h1] = await Promise.all([
+        api.getTicker(symbol),
+        api.getCandles(symbol, "15m", 120),
+        api.getCandles(symbol, "1h", 120),
+      ]);
+
+      const signal = require("./strategy")
+        .analyzeMultiTimeframeSymbol(symbol, m15, h1);
+
+      return interaction.editReply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(signal?.direction === "LONG" ? 0x22c55e :
+                     signal?.direction === "SHORT" ? 0xef4444 : 0x94a3b8)
+            .setTitle(`📌 ${symbol}`)
+            .setDescription([
+              `H1趨勢：${signal?.direction || "N/A"}`,
+              `現價：${ticker.price}`,
+              `Entry：${signal?.entry || "-"}`,
+              `TP1：${signal?.takeProfit1 || "-"}`,
+              `TP2：${signal?.takeProfit2 || "-"}`,
+              `SL：${signal?.stopLoss || "-"}`,
+              `RR：${signal?.riskReward || "-"}`,
+              `信心：${signal?.confidence || "-"}`
+            ].join("\n"))
+        ]
+      });
+    }
+
+    /* -------- 訊號 -------- */
+    if (interaction.commandName === "訊號") {
+      const limit = Math.min(
+        interaction.options.getInteger("數量") || CONFIG.scanLimit,
+        50
+      );
+
+      await interaction.editReply("🔍 掃描中...");
+
+      const signals = await scanMarket(api, {
+        scanLimit: limit,
+      });
+
+      const sorted = signals.sort(
+        (a, b) => (b.score * b.riskReward) - (a.score * a.riskReward)
+      );
+
+      return interaction.followUp({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xf59e0b)
+            .setTitle("⚡ 訊號列表")
+            .setDescription(
+              sorted.map((s, i) =>
+                `**${i + 1}. ${s.symbol} ${s.direction}**
+Score:${s.score} RR:${s.riskReward}
+Entry:${s.entry}`
+              ).join("\n\n")
+            )
+        ]
+      });
+    }
+
+    /* -------- 狀態 -------- */
+    if (interaction.commandName === "狀態") {
+      return interaction.editReply(
+        `📡 ${api.name}｜H1→M15｜Top ${CONFIG.scanLimit}`
+      );
+    }
+
+  } catch (err) {
+    return interaction.editReply(`錯誤：${err.message}`);
   }
-);
-
-/* ---------------------------------- */
-/* Process Events */
-/* ---------------------------------- */
-
-process.on(
-  "unhandledRejection",
-  (err) => {
-    log("unhandled rejection:", err);
-  }
-);
-
-process.on(
-  "uncaughtException",
-  (err) => {
-    log("uncaught exception:", err);
-  }
-);
-
-/* ---------------------------------- */
-/* Login */
-/* ---------------------------------- */
-
-client.login(CONFIG.token).catch((err) => {
-  log("discord login failed:", err.message);
-
-  process.exit(1);
 });
+
+/* ---------------------------------- */
+/* ERROR HANDLING */
+/* ---------------------------------- */
+
+process.on("unhandledRejection", err =>
+  log("unhandled:", err)
+);
+
+process.on("uncaughtException", err =>
+  log("exception:", err)
+);
+
+/* ---------------------------------- */
+/* LOGIN */
+/* ---------------------------------- */
+
+client.login(CONFIG.token);
