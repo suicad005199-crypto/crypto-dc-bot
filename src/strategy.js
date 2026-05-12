@@ -1,18 +1,18 @@
 const DEFAULTS = {
-  candleLimit: 120,
+  candleLimit: 240,
 
-  minScore: 68,
+  minScore: 70,
   maxSignals: 5,
 
-  atrStopMultiplier: 1.2,
-  atrTargetMultiplier: 1.8,
+  atrStopMultiplier: 1.4,
+  atrTargetMultiplier: 2.2,
 
-  minRiskReward: 1.25,
+  minRiskReward: 1.8,
 
   volumeThreshold: 1.15,
-  momentumThreshold: 0.35,
+  momentumThreshold: 0.25,
 
-  minCandles: 60,
+  minCandles: 220,
 };
 
 /* ---------------------------------- */
@@ -28,10 +28,8 @@ function average(values = []) {
   if (!values.length) return 0;
 
   return (
-    values.reduce(
-      (sum, value) => sum + safeNumber(value),
-      0
-    ) / values.length
+    values.reduce((sum, value) => sum + safeNumber(value), 0) /
+    values.length
   );
 }
 
@@ -44,26 +42,11 @@ function pct(from, to) {
 function roundPrice(price) {
   const value = safeNumber(price);
 
-  if (value >= 1000) {
-    return Number(value.toFixed(2));
-  }
-
-  if (value >= 1) {
-    return Number(value.toFixed(4));
-  }
-
-  if (value >= 0.01) {
-    return Number(value.toFixed(6));
-  }
+  if (value >= 1000) return Number(value.toFixed(2));
+  if (value >= 1) return Number(value.toFixed(4));
+  if (value >= 0.01) return Number(value.toFixed(6));
 
   return Number(value.toFixed(8));
-}
-
-function clamp(value, min, max) {
-  return Math.max(
-    min,
-    Math.min(max, value)
-  );
 }
 
 /* ---------------------------------- */
@@ -73,8 +56,7 @@ function clamp(value, min, max) {
 function ema(values, length) {
   if (!values.length) return [];
 
-  const multiplier =
-    2 / (length + 1);
+  const multiplier = 2 / (length + 1);
 
   let current = values[0];
 
@@ -89,92 +71,114 @@ function ema(values, length) {
   });
 }
 
-function rsi(closes, length = 14) {
-  if (closes.length <= length) {
-    return 50;
-  }
+function sma(values, length) {
+  if (!values.length) return [];
 
-  let gains = 0;
-  let losses = 0;
-
-  for (let i = 1; i <= length; i++) {
-    const diff =
-      closes[i] - closes[i - 1];
-
-    if (diff >= 0) {
-      gains += diff;
-    } else {
-      losses -= diff;
+  return values.map((_, index) => {
+    if (index < length - 1) {
+      return values[index];
     }
-  }
 
-  let avgGain = gains / length;
-  let avgLoss = losses / length;
+    const slice = values.slice(
+      index - length + 1,
+      index + 1
+    );
 
-  for (
-    let i = length + 1;
-    i < closes.length;
-    i++
-  ) {
-    const diff =
-      closes[i] - closes[i - 1];
-
-    avgGain =
-      (avgGain * (length - 1) +
-        Math.max(diff, 0)) /
-      length;
-
-    avgLoss =
-      (avgLoss * (length - 1) +
-        Math.max(-diff, 0)) /
-      length;
-  }
-
-  if (avgLoss === 0) {
-    return 100;
-  }
-
-  const rs = avgGain / avgLoss;
-
-  return 100 - 100 / (1 + rs);
+    return average(slice);
+  });
 }
 
 function atr(candles, length = 14) {
-  if (candles.length <= length) {
-    return 0;
-  }
+  if (candles.length <= length) return 0;
 
   const ranges = [];
 
-  for (
-    let i = 1;
-    i < candles.length;
-    i++
-  ) {
+  for (let i = 1; i < candles.length; i++) {
     const current = candles[i];
-    const prevClose =
-      candles[i - 1].close;
+    const prevClose = candles[i - 1].close;
 
     ranges.push(
       Math.max(
         current.high - current.low,
-        Math.abs(
-          current.high - prevClose
-        ),
-        Math.abs(
-          current.low - prevClose
-        )
+        Math.abs(current.high - prevClose),
+        Math.abs(current.low - prevClose)
       )
     );
   }
 
-  return average(
-    ranges.slice(-length)
-  );
+  return average(ranges.slice(-length));
 }
 
 /* ---------------------------------- */
-/* Risk Model */
+/* Trend Filter (H1) */
+/* ---------------------------------- */
+
+function getHigherTimeframeBias(candles) {
+  if (
+    !Array.isArray(candles) ||
+    candles.length < DEFAULTS.minCandles
+  ) {
+    return null;
+  }
+
+  const closes = candles.map((x) => x.close);
+
+  const ma83 = sma(closes, 83);
+  const ema200 = ema(closes, 200);
+
+  const lastClose = closes[closes.length - 1];
+
+  const ma83Now = ma83[ma83.length - 1];
+  const ema200Now = ema200[ema200.length - 1];
+
+  const momentum = pct(
+    closes[closes.length - 7],
+    lastClose
+  );
+
+  /* ---------------- LONG ---------------- */
+
+  if (
+    lastClose > ma83Now &&
+    ma83Now > ema200Now &&
+    momentum > 0
+  ) {
+    return {
+      direction: "LONG",
+      momentum: Number(momentum.toFixed(2)),
+      trend: "H1 多頭趨勢",
+      ma83: roundPrice(ma83Now),
+      ema200: roundPrice(ema200Now),
+    };
+  }
+
+  /* ---------------- SHORT ---------------- */
+
+  if (
+    lastClose < ma83Now &&
+    ma83Now < ema200Now &&
+    momentum < 0
+  ) {
+    return {
+      direction: "SHORT",
+      momentum: Number(momentum.toFixed(2)),
+      trend: "H1 空頭趨勢",
+      ma83: roundPrice(ma83Now),
+      ema200: roundPrice(ema200Now),
+    };
+  }
+
+  return {
+    direction: "NEUTRAL",
+    momentum: Number(momentum.toFixed(2)),
+    trend: "H1 無明確趨勢",
+    ma83: roundPrice(ma83Now),
+    ema200: roundPrice(ema200Now),
+  };
+}
+
+/* ---------------------------------- */
+/* Entry Levels */
 /* ---------------------------------- */
 
 function buildTradeLevels(
@@ -184,20 +188,16 @@ function buildTradeLevels(
   options
 ) {
   const stopDistance = Math.max(
-    entry * 0.006,
-    atrValue *
-      options.atrStopMultiplier
+    atrValue * options.atrStopMultiplier,
+    entry * 0.005
   );
 
   const targetDistance = Math.max(
-    stopDistance *
-      options.minRiskReward,
-    atrValue *
-      options.atrTargetMultiplier
+    atrValue * options.atrTargetMultiplier,
+    stopDistance * options.minRiskReward
   );
 
-  const isLong =
-    direction === "LONG";
+  const isLong = direction === "LONG";
 
   return {
     entry: roundPrice(entry),
@@ -216,235 +216,24 @@ function buildTradeLevels(
 
     takeProfit2: roundPrice(
       isLong
-        ? entry +
-            targetDistance * 1.65
-        : entry -
-            targetDistance * 1.65
+        ? entry + targetDistance * 1.8
+        : entry - targetDistance * 1.8
     ),
 
     riskReward: Number(
-      (
-        targetDistance /
-        stopDistance
-      ).toFixed(2)
+      (targetDistance / stopDistance).toFixed(2)
     ),
   };
 }
 
 /* ---------------------------------- */
-/* Score Engine */
+/* M15 Entry Strategy */
 /* ---------------------------------- */
 
-function createScoreResult(direction) {
-  return {
-    direction,
-    score: 0,
-    reasons: [],
-  };
-}
-
-function addScore(
-  result,
-  condition,
-  score,
-  reason
-) {
-  if (!condition) return;
-
-  result.score += score;
-
-  result.reasons.push(reason);
-}
-
-function scoreLong(input, options) {
-  const result =
-    createScoreResult("LONG");
-
-  addScore(
-    result,
-    input.lastClose >
-      input.emaTrendNow,
-    20,
-    "價格站上 EMA50"
-  );
-
-  addScore(
-    result,
-    input.emaFastNow >
-      input.emaSlowNow,
-    22,
-    "EMA9 > EMA21"
-  );
-
-  addScore(
-    result,
-    input.momentum >
-      options.momentumThreshold,
-    18,
-    "短線動能偏強"
-  );
-
-  addScore(
-    result,
-    input.rsiNow >= 52 &&
-      input.rsiNow <= 72,
-    18,
-    "RSI 多方健康"
-  );
-
-  addScore(
-    result,
-    input.volumeRatio >=
-      options.volumeThreshold,
-    14,
-    "量能放大"
-  );
-
-  addScore(
-    result,
-    input.lastClose >
-      input.emaFastNow,
-    8,
-    "價格貼近強勢區"
-  );
-
-  return result;
-}
-
-function scoreShort(input, options) {
-  const result =
-    createScoreResult("SHORT");
-
-  addScore(
-    result,
-    input.lastClose <
-      input.emaTrendNow,
-    20,
-    "價格跌破 EMA50"
-  );
-
-  addScore(
-    result,
-    input.emaFastNow <
-      input.emaSlowNow,
-    22,
-    "EMA9 < EMA21"
-  );
-
-  addScore(
-    result,
-    input.momentum <
-      -options.momentumThreshold,
-    18,
-    "短線動能偏弱"
-  );
-
-  addScore(
-    result,
-    input.rsiNow <= 48 &&
-      input.rsiNow >= 28,
-    18,
-    "RSI 空方健康"
-  );
-
-  addScore(
-    result,
-    input.volumeRatio >=
-      options.volumeThreshold,
-    14,
-    "量能放大"
-  );
-
-  addScore(
-    result,
-    input.lastClose <
-      input.emaFastNow,
-    8,
-    "價格貼近弱勢區"
-  );
-
-  return result;
-}
-
-/* ---------------------------------- */
-/* Higher Timeframe Bias */
-/* ---------------------------------- */
-
-function getHigherTimeframeBias(
-  candles
-) {
-  if (
-    !Array.isArray(candles) ||
-    candles.length <
-      DEFAULTS.minCandles
-  ) {
-    return null;
-  }
-
-  const closes = candles.map(
-    (x) => x.close
-  );
-
-  const emaFast = ema(closes, 21);
-  const emaSlow = ema(closes, 50);
-
-  const lastClose =
-    closes[closes.length - 1];
-
-  const emaFastNow =
-    emaFast[emaFast.length - 1];
-
-  const emaSlowNow =
-    emaSlow[emaSlow.length - 1];
-
-  const momentum = pct(
-    closes[closes.length - 7],
-    lastClose
-  );
-
-  const isLong =
-    lastClose > emaSlowNow &&
-    emaFastNow > emaSlowNow &&
-    momentum > 0;
-
-  const isShort =
-    lastClose < emaSlowNow &&
-    emaFastNow < emaSlowNow &&
-    momentum < 0;
-
-  if (isLong) {
-    return {
-      direction: "LONG",
-      momentum: Number(
-        momentum.toFixed(2)
-      ),
-    };
-  }
-
-  if (isShort) {
-    return {
-      direction: "SHORT",
-      momentum: Number(
-        momentum.toFixed(2)
-      ),
-    };
-  }
-
-  return {
-    direction: "NEUTRAL",
-    momentum: Number(
-      momentum.toFixed(2)
-    ),
-  };
-}
-
-/* ---------------------------------- */
-/* Symbol Analysis */
-/* ---------------------------------- */
-
-function analyzeSymbol(
+function analyzeEntry(
   symbol,
   candles,
+  higherBias,
   options = {}
 ) {
   const config = {
@@ -454,36 +243,23 @@ function analyzeSymbol(
 
   if (
     !Array.isArray(candles) ||
-    candles.length <
-      config.minCandles
+    candles.length < config.minCandles
   ) {
     return null;
   }
 
-  const closes = candles.map(
-    (x) => x.close
-  );
+  const closes = candles.map((x) => x.close);
+  const volumes = candles.map((x) => x.volume);
 
-  const volumes = candles.map(
-    (x) => x.volume
-  );
+  const last = candles[candles.length - 1];
 
-  const last =
-    candles[candles.length - 1];
+  const ma83 = sma(closes, 83);
+  const ema200 = ema(closes, 200);
 
-  const emaFast = ema(closes, 9);
-  const emaSlow = ema(closes, 21);
-  const emaTrend = ema(closes, 50);
+  const ma83Now = ma83[ma83.length - 1];
+  const ema200Now = ema200[ema200.length - 1];
 
-  const atrValue = atr(
-    candles,
-    14
-  );
-
-  const rsiNow = rsi(
-    closes,
-    14
-  );
+  const atrValue = atr(candles, 14);
 
   const recentVolume = average(
     volumes.slice(-5)
@@ -498,254 +274,196 @@ function analyzeSymbol(
     : 1;
 
   const momentum = pct(
-    closes[closes.length - 6],
+    closes[closes.length - 5],
     last.close
   );
 
-  const input = {
-    lastClose: last.close,
+  let score = 0;
+  const reasons = [];
 
-    emaFastNow:
-      emaFast[emaFast.length - 1],
+  /* ---------------------------------- */
+  /* LONG */
+  /* ---------------------------------- */
 
-    emaSlowNow:
-      emaSlow[emaSlow.length - 1],
+  if (higherBias.direction === "LONG") {
+    if (last.close > ma83Now) {
+      score += 30;
+      reasons.push("價格站上 MA83");
+    }
 
-    emaTrendNow:
-      emaTrend[emaTrend.length - 1],
+    if (ma83Now > ema200Now) {
+      score += 30;
+      reasons.push("MA83 > EMA200");
+    }
 
-    rsiNow,
-    volumeRatio,
-    momentum,
-  };
+    if (momentum > config.momentumThreshold) {
+      score += 20;
+      reasons.push("M15 多方動能");
+    }
 
-  const long = scoreLong(
-    input,
-    config
-  );
+    if (volumeRatio >= config.volumeThreshold) {
+      score += 20;
+      reasons.push("量能放大");
+    }
+  }
 
-  const short = scoreShort(
-    input,
-    config
-  );
+  /* ---------------------------------- */
+  /* SHORT */
+  /* ---------------------------------- */
 
-  const picked =
-    long.score >= short.score
-      ? long
-      : short;
+  if (higherBias.direction === "SHORT") {
+    if (last.close < ma83Now) {
+      score += 30;
+      reasons.push("價格跌破 MA83");
+    }
 
-  const levels =
-    buildTradeLevels(
-      picked.direction,
-      last.close,
-      atrValue,
-      config
-    );
+    if (ma83Now < ema200Now) {
+      score += 30;
+      reasons.push("MA83 < EMA200");
+    }
 
-  if (
-    picked.score <
-      config.minScore ||
-    levels.riskReward <
-      config.minRiskReward
-  ) {
+    if (momentum < -config.momentumThreshold) {
+      score += 20;
+      reasons.push("M15 空方動能");
+    }
+
+    if (volumeRatio >= config.volumeThreshold) {
+      score += 20;
+      reasons.push("量能放大");
+    }
+  }
+
+  if (score < config.minScore) {
     return null;
   }
+
+  const levels = buildTradeLevels(
+    higherBias.direction,
+    last.close,
+    atrValue,
+    config
+  );
 
   return {
     symbol,
 
-    direction: picked.direction,
+    direction: higherBias.direction,
 
-    score: clamp(
-      picked.score,
-      0,
-      100
-    ),
+    trend: higherBias.trend,
 
-    confidence: `${clamp(
-      picked.score,
-      0,
-      100
-    )}%`,
+    confidence: `${score}%`,
+    score,
 
     entry: levels.entry,
 
-    takeProfit1:
-      levels.takeProfit1,
+    takeProfit1: levels.takeProfit1,
+    takeProfit2: levels.takeProfit2,
 
-    takeProfit2:
-      levels.takeProfit2,
+    stopLoss: levels.stopLoss,
 
-    stopLoss:
-      levels.stopLoss,
+    riskReward: levels.riskReward,
 
-    riskReward:
-      levels.riskReward,
+    momentum: Number(momentum.toFixed(2)),
 
-    rsi: Number(
-      rsiNow.toFixed(2)
-    ),
+    volumeRatio: Number(volumeRatio.toFixed(2)),
 
     atr: roundPrice(atrValue),
 
-    momentum: Number(
-      momentum.toFixed(2)
-    ),
+    ma83: roundPrice(ma83Now),
+    ema200: roundPrice(ema200Now),
 
-    volumeRatio: Number(
-      volumeRatio.toFixed(2)
-    ),
+    higherTimeframeMomentum:
+      higherBias.momentum,
 
-    reasons: picked.reasons.slice(
-      0,
-      4
-    ),
+    higherTimeframe: "1h",
+    lowerTimeframe: "15m",
+
+    reasons,
 
     timestamp: Date.now(),
   };
 }
 
 /* ---------------------------------- */
-/* Multi Timeframe */
+/* Scanner */
 /* ---------------------------------- */
 
-function analyzeMultiTimeframeSymbol(
-  symbol,
-  lowerCandles,
-  higherCandles,
-  options = {}
-) {
-  const bias =
-    getHigherTimeframeBias(
-      higherCandles
-    );
-
-  if (
-    !bias ||
-    bias.direction === "NEUTRAL"
-  ) {
-    return null;
-  }
-
-  const signal = analyzeSymbol(
-    symbol,
-    lowerCandles,
-    options
-  );
-
-  if (
-    !signal ||
-    signal.direction !==
-      bias.direction
-  ) {
-    return null;
-  }
-
-  return {
-    ...signal,
-
-    higherTimeframe:
-      options.higherTimeframe ||
-      "1h",
-
-    lowerTimeframe:
-      options.timeframe ||
-      "15m",
-
-    higherTimeframeMomentum:
-      bias.momentum,
-
-    reasons: [
-      `HTF ${bias.direction} Bias`,
-      ...signal.reasons,
-    ].slice(0, 5),
-  };
-}
-
-/* ---------------------------------- */
-/* Market Scanner */
-/* ---------------------------------- */
-
-async function scanMarket(
-  api,
-  options = {}
-) {
+async function scanMarket(api, options = {}) {
   const config = {
     ...DEFAULTS,
     ...options,
   };
 
-  const symbols =
-    await api.getTopSymbols(
-      config.scanLimit || 30
-    );
+  const symbols = await api.getTopSymbols(
+    config.scanLimit || 30
+  );
 
-  const tasks = symbols.map(
-    async (symbol) => {
-      try {
-        const [
-          lowerCandles,
-          higherCandles,
-        ] = await Promise.all([
+  const tasks = symbols.map(async (symbol) => {
+    try {
+      const [m15Candles, h1Candles] =
+        await Promise.all([
           api.getCandles(
             symbol,
-            config.timeframe ||
-              "15m",
+            "15m",
             config.candleLimit
           ),
 
           api.getCandles(
             symbol,
-            config.higherTimeframe ||
-              "1h",
+            "1h",
             config.candleLimit
           ),
         ]);
 
-        const signal =
-          analyzeMultiTimeframeSymbol(
-            symbol,
-            lowerCandles,
-            higherCandles,
-            config
-          );
+      const h1Bias =
+        getHigherTimeframeBias(h1Candles);
 
-        return signal
-          ? {
-              ...signal,
-              exchange: api.name,
-            }
-          : null;
-      } catch (err) {
-        console.warn(
-          `scan skip ${symbol}:`,
-          err.message
-        );
-
+      if (
+        !h1Bias ||
+        h1Bias.direction === "NEUTRAL"
+      ) {
         return null;
       }
-    }
-  );
 
-  const results =
-    await Promise.all(tasks);
+      const signal = analyzeEntry(
+        symbol,
+        m15Candles,
+        h1Bias,
+        config
+      );
+
+      return signal
+        ? {
+            ...signal,
+            exchange: api.name,
+          }
+        : null;
+    } catch (err) {
+      console.warn(
+        `scan skip ${symbol}:`,
+        err.message
+      );
+
+      return null;
+    }
+  });
+
+  const results = await Promise.all(tasks);
 
   return results
     .filter(Boolean)
-    .sort(
-      (a, b) => b.score - a.score
-    )
+    .sort((a, b) => b.score - a.score)
     .slice(0, config.maxSignals);
 }
 
 module.exports = {
-  analyzeSymbol,
-  analyzeMultiTimeframeSymbol,
   scanMarket,
+  analyzeEntry,
+  getHigherTimeframeBias,
 
   indicators: {
     ema,
-    rsi,
+    sma,
     atr,
   },
 };
