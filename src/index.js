@@ -1,108 +1,197 @@
-// src/formatter.js
-// Discord Embed 格式化模組
+// src/index.js
+require("dotenv").config();
 
-const { EmbedBuilder } = require("discord.js");
+console.log("🚀 Bot 程式啟動中...");
+console.log("Node 版本:", process.version);
+console.log("TOKEN 存在:", !!process.env.DISCORD_TOKEN);
+console.log("CHANNEL_ID:", process.env.DISCORD_CHANNEL_ID);
 
-// 類型對應 emoji 和顏色
-const TYPE_META = {
-  L1:     { emoji: "🔵", label: "Layer 1 主鏈",    color: 0x3b82f6 },
-  L2:     { emoji: "🟣", label: "Layer 2 擴容",    color: 0x8b5cf6 },
-  DEFI:   { emoji: "🟢", label: "DeFi 協議",       color: 0x10b981 },
-  MEME:   { emoji: "🐸", label: "Meme 幣",         color: 0xf59e0b },
-  AI:     { emoji: "🤖", label: "AI 概念",         color: 0x06b6d4 },
-  GAMEFI: { emoji: "🎮", label: "GameFi / NFT",   color: 0xf97316 },
-  STABLE: { emoji: "💵", label: "穩定幣",          color: 0x6b7280 },
-  ALT:    { emoji: "⚪", label: "山寨幣",          color: 0x9ca3af },
-};
+const { Client, GatewayIntentBits, Events, SlashCommandBuilder, REST, Routes } = require("discord.js");
+const { getExchange } = require("./exchangeAPI");
+const { buildTickerEmbed, buildOverviewEmbed, buildAlertEmbed } = require("./formatter");
 
-function formatPrice(price) {
-  if (price >= 1000) return price.toLocaleString("en-US", { maximumFractionDigits: 2 });
-  if (price >= 1)    return price.toFixed(4);
-  if (price >= 0.01) return price.toFixed(6);
-  return price.toFixed(8);
+const TOKEN      = process.env.DISCORD_TOKEN;
+const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
+const EXCHANGE   = process.env.EXCHANGE || "okx";
+const THRESHOLD  = parseFloat(process.env.ALERT_THRESHOLD || "3");
+const INTERVAL   = parseInt(process.env.POLL_INTERVAL || "10000");
+const WATCH_RAW  = process.env.WATCH_SYMBOLS || "";
+
+if (!TOKEN) {
+  console.error("❌ 錯誤：DISCORD_TOKEN 未設定！");
+  process.exit(1);
 }
 
-function formatVolume(vol) {
-  if (vol >= 1e9) return `$${(vol / 1e9).toFixed(2)}B`;
-  if (vol >= 1e6) return `$${(vol / 1e6).toFixed(2)}M`;
-  if (vol >= 1e3) return `$${(vol / 1e3).toFixed(2)}K`;
-  return `$${vol.toFixed(2)}`;
+if (!CHANNEL_ID) {
+  console.error("❌ 錯誤：DISCORD_CHANNEL_ID 未設定！");
+  process.exit(1);
 }
 
-// ─── 單一交易對 Embed ──────────────────────────────────────
-function buildTickerEmbed(ticker) {
-  const meta = TYPE_META[ticker.type] || TYPE_META.ALT;
-  const isUp = ticker.priceChange >= 0;
-  const changeStr = `${isUp ? "▲" : "▼"} ${Math.abs(ticker.priceChange).toFixed(2)}%`;
-  const color = isUp ? 0x22c55e : 0xef4444;
+const api = getExchange(EXCHANGE);
+console.log("📡 使用交易所:", EXCHANGE);
 
-  return new EmbedBuilder()
-    .setColor(color)
-    .setTitle(`${meta.emoji} ${ticker.symbol}  ${changeStr}`)
-    .setDescription(
-      `**交易標的類型：** ${meta.label}\n` +
-      `**交易所：** ${ticker.exchange}`
-    )
-    .addFields(
-      { name: "💰 當前價格",  value: `\`$${formatPrice(ticker.price)}\``,          inline: true },
-      { name: "📈 24h 最高",  value: `\`$${formatPrice(ticker.high24h)}\``,        inline: true },
-      { name: "📉 24h 最低",  value: `\`$${formatPrice(ticker.low24h)}\``,         inline: true },
-      { name: "📊 24h 成交額", value: formatVolume(ticker.quoteVolume24h),          inline: true },
-      { name: "🪙 基礎資產",  value: ticker.baseAsset,                             inline: true },
-      { name: "💱 計價資產",  value: ticker.quoteAsset,                            inline: true },
-    )
-    .setFooter({ text: `${ticker.exchange} · 更新時間` })
-    .setTimestamp(ticker.timestamp);
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+});
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName("price")
+    .setDescription("查詢單一交易對即時資訊")
+    .addStringOption((opt) =>
+      opt.setName("symbol").setDescription("交易對，例如 BTC/USDT").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("market")
+    .setDescription("顯示前 N 大交易對總覽")
+    .addIntegerOption((opt) =>
+      opt.setName("limit").setDescription("顯示幾個（預設 10）").setRequired(false)
+    ),
+  new SlashCommandBuilder()
+    .setName("watch")
+    .setDescription("設定自動監控的交易對（逗號分隔）")
+    .addStringOption((opt) =>
+      opt.setName("symbols").setDescription("例如 BTC/USDT,ETH/USDT").setRequired(true)
+    ),
+  new SlashCommandBuilder()
+    .setName("status")
+    .setDescription("顯示目前監控狀態"),
+  new SlashCommandBuilder()
+    .setName("detect")
+    .setDescription("自動偵測交易所前 N 大幣種並開始監控")
+    .addIntegerOption((opt) =>
+      opt.setName("limit").setDescription("偵測幾個（預設 20）").setRequired(false)
+    ),
+].map((cmd) => cmd.toJSON());
+
+let watchSymbols = WATCH_RAW ? WATCH_RAW.split(",").map((s) => s.trim()) : [];
+let monitorInterval = null;
+let lastPrices = {};
+
+async function startMonitor(channel) {
+  if (monitorInterval) clearInterval(monitorInterval);
+  console.log(`🚀 開始監控 ${watchSymbols.length} 個交易對...`);
+
+  monitorInterval = setInterval(async () => {
+    if (watchSymbols.length === 0) return;
+    try {
+      const tickers = await api.getMultipleTickers(watchSymbols);
+      for (const ticker of tickers) {
+        const absChange = Math.abs(ticker.priceChange);
+        const prevPrice = lastPrices[ticker.symbol];
+        if (absChange >= THRESHOLD) {
+          const alreadyAlerted = prevPrice?.alerted && Date.now() - prevPrice.alertedAt < 3600000;
+          if (!alreadyAlerted) {
+            await channel.send({ embeds: [buildAlertEmbed(ticker, THRESHOLD)] });
+            lastPrices[ticker.symbol] = { price: ticker.price, alerted: true, alertedAt: Date.now() };
+          }
+        } else {
+          lastPrices[ticker.symbol] = { price: ticker.price, alerted: false };
+        }
+      }
+      console.log(`[${new Date().toLocaleTimeString()}] 掃描完成 ${tickers.length} 個交易對`);
+    } catch (err) {
+      console.error("監控錯誤:", err.message);
+    }
+  }, INTERVAL);
 }
 
-// ─── 多標的總覽 Embed ──────────────────────────────────────
-function buildOverviewEmbed(tickers, exchange) {
-  const embed = new EmbedBuilder()
-    .setColor(0x6366f1)
-    .setTitle(`📡 ${exchange} 市場總覽 — 前 ${tickers.length} 大交易對`)
-    .setTimestamp();
+client.once(Events.ClientReady, async (c) => {
+  console.log(`✅ Bot 已上線：${c.user.tag}`);
 
-  // 依類型分組
-  const groups = {};
-  tickers.forEach((t) => {
-    if (!groups[t.type]) groups[t.type] = [];
-    groups[t.type].push(t);
-  });
-
-  for (const [type, list] of Object.entries(groups)) {
-    const meta = TYPE_META[type] || TYPE_META.ALT;
-    const lines = list.map((t) => {
-      const isUp = t.priceChange >= 0;
-      const arrow = isUp ? "▲" : "▼";
-      return `${arrow} **${t.baseAsset}** $${formatPrice(t.price)} (${isUp ? "+" : ""}${t.priceChange.toFixed(2)}%)`;
-    });
-    embed.addFields({
-      name: `${meta.emoji} ${meta.label}`,
-      value: lines.join("\n"),
-      inline: false,
-    });
+  const rest = new REST({ version: "10" }).setToken(TOKEN);
+  try {
+    await rest.put(Routes.applicationCommands(c.user.id), { body: commands });
+    console.log("✅ Slash Commands 已註冊");
+  } catch (err) {
+    console.error("Slash Commands 註冊失敗:", err.message);
   }
 
-  return embed;
-}
+  if (watchSymbols.length === 0) {
+    console.log("🔍 自動偵測前 20 大幣種...");
+    try {
+      watchSymbols = await api.getTopSymbols(20);
+      console.log("✅ 偵測完成:", watchSymbols.slice(0, 5).join(", "), "...");
+    } catch (err) {
+      console.error("自動偵測失敗:", err.message);
+    }
+  }
 
-// ─── 警報 Embed ────────────────────────────────────────────
-function buildAlertEmbed(ticker, threshold) {
-  const isUp = ticker.priceChange >= 0;
-  const meta = TYPE_META[ticker.type] || TYPE_META.ALT;
-  const color = isUp ? 0x22c55e : 0xef4444;
-  const direction = isUp ? "🚀 急漲警報" : "🔻 急跌警報";
+  try {
+    const channel = await c.channels.fetch(CHANNEL_ID);
+    console.log("✅ 頻道找到:", channel.name);
+    await startMonitor(channel);
 
-  return new EmbedBuilder()
-    .setColor(color)
-    .setTitle(`${direction}！${ticker.symbol}`)
-    .setDescription(
-      `**${meta.emoji} ${meta.label}** 在 24h 內波動超過 **${threshold}%**\n\n` +
-      `📌 當前價格：**$${formatPrice(ticker.price)}**\n` +
-      `📈 24h 漲跌：**${ticker.priceChange >= 0 ? "+" : ""}${ticker.priceChange.toFixed(2)}%**`
-    )
-    .setFooter({ text: `來源：${ticker.exchange}` })
-    .setTimestamp();
-}
+    const tickers = await api.getMultipleTickers(watchSymbols.slice(0, 15));
+    await channel.send({ embeds: [buildOverviewEmbed(tickers, EXCHANGE)] });
+    console.log("✅ 市場總覽已發送！");
+  } catch (err) {
+    console.error("❌ 頻道錯誤:", err.message);
+  }
+});
 
-module.exports = { buildTickerEmbed, buildOverviewEmbed, buildAlertEmbed, TYPE_META };
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  await interaction.deferReply();
+
+  try {
+    switch (interaction.commandName) {
+      case "price": {
+        const sym = interaction.options.getString("symbol").toUpperCase();
+        const ticker = await api.getTicker(sym);
+        await interaction.editReply({ embeds: [buildTickerEmbed(ticker)] });
+        break;
+      }
+      case "market": {
+        const limit = interaction.options.getInteger("limit") || 10;
+        const symbols = await api.getTopSymbols(limit);
+        const tickers = await api.getMultipleTickers(symbols);
+        await interaction.editReply({ embeds: [buildOverviewEmbed(tickers, EXCHANGE)] });
+        break;
+      }
+      case "watch": {
+        const input = interaction.options.getString("symbols");
+        watchSymbols = input.split(",").map((s) => s.trim().toUpperCase());
+        lastPrices = {};
+        await startMonitor(interaction.channel);
+        await interaction.editReply(`✅ 已設定監控：**${watchSymbols.join(", ")}**`);
+        break;
+      }
+      case "status": {
+        await interaction.editReply(
+          `**📡 監控狀態**\n• 交易所：${EXCHANGE}\n• 標的：${watchSymbols.join(", ") || "無"}\n• 間隔：${INTERVAL/1000}秒\n• 閾值：±${THRESHOLD}%`
+        );
+        break;
+      }
+      case "detect": {
+        const limit = interaction.options.getInteger("limit") || 20;
+        watchSymbols = await api.getTopSymbols(limit);
+        lastPrices = {};
+        await startMonitor(interaction.channel);
+        const tickers = await api.getMultipleTickers(watchSymbols.slice(0, 15));
+        await interaction.editReply({
+          content: `✅ 偵測並監控 **${watchSymbols.length}** 個交易對`,
+          embeds: [buildOverviewEmbed(tickers, EXCHANGE)],
+        });
+        break;
+      }
+    }
+  } catch (err) {
+    console.error(`指令錯誤 [${interaction.commandName}]:`, err.message);
+    await interaction.editReply(`❌ 錯誤：${err.message}`);
+  }
+});
+
+client.on("error", (err) => {
+  console.error("❌ Discord 客戶端錯誤:", err.message);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("❌ 未處理的錯誤:", err.message);
+});
+
+console.log("🔐 嘗試登入 Discord...");
+client.login(TOKEN).catch((err) => {
+  console.error("❌ 登入失敗:", err.message);
+  process.exit(1);
+});
