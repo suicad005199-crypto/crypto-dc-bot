@@ -8,7 +8,7 @@ console.log("CHANNEL_ID:", process.env.DISCORD_CHANNEL_ID);
 
 const { Client, GatewayIntentBits, Events, SlashCommandBuilder, REST, Routes } = require("discord.js");
 const { getExchange } = require("./exchangeAPI");
-const { buildTickerEmbed, buildOverviewEmbed, buildAlertEmbed } = require("./formatter");
+const { buildTickerEmbed, buildOverviewEmbed, buildAlertEmbed, buildSignalEmbed } = require("./formatter");
 
 const TOKEN      = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
@@ -16,7 +16,11 @@ const EXCHANGE   = process.env.EXCHANGE || "okx";
 const THRESHOLD  = parseFloat(process.env.ALERT_THRESHOLD || "3");
 const INTERVAL   = parseInt(process.env.POLL_INTERVAL || "10000");
 const WATCH_RAW  = process.env.WATCH_SYMBOLS || "";
-const OVERVIEW_INTERVAL = 30 * 60 * 1000; // 30 分鐘
+const OVERVIEW_INTERVAL = 30 * 60 * 1000;
+
+// TP/SL 設定（風報比 1:2）
+const SL_PCT = 0.02;  // 止損 2%
+const TP_PCT = 0.04;  // 止盈 4%（風報比 1:2）
 
 if (!TOKEN) { console.error("❌ DISCORD_TOKEN 未設定！"); process.exit(1); }
 if (!CHANNEL_ID) { console.error("❌ DISCORD_CHANNEL_ID 未設定！"); process.exit(1); }
@@ -25,13 +29,17 @@ const api = getExchange(EXCHANGE);
 console.log("📡 使用交易所:", EXCHANGE);
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
 const commands = [
   new SlashCommandBuilder()
     .setName("price")
-    .setDescription("查詢單一交易對即時資訊")
+    .setDescription("查詢單一交易對即時資訊 + 進場訊號")
     .addStringOption((opt) =>
       opt.setName("symbol").setDescription("交易對，例如 BTC/USDT").setRequired(true)
     ),
@@ -56,12 +64,41 @@ const commands = [
     .addIntegerOption((opt) =>
       opt.setName("limit").setDescription("偵測幾個（預設 20）").setRequired(false)
     ),
+  new SlashCommandBuilder()
+    .setName("signal")
+    .setDescription("查詢單一幣種進場訊號（含 TP/SL）")
+    .addStringOption((opt) =>
+      opt.setName("symbol").setDescription("交易對，例如 BTC/USDT").setRequired(true)
+    ),
 ].map((cmd) => cmd.toJSON());
 
 let watchSymbols = WATCH_RAW ? WATCH_RAW.split(",").map((s) => s.trim()) : [];
 let monitorInterval = null;
 let overviewInterval = null;
 let lastPrices = {};
+let mainChannel = null;
+
+// ─── 計算 TP/SL（固定%，風報比 1:2）─────────────────────
+function calcSignal(price, priceChange) {
+  const direction = priceChange >= 0 ? "LONG" : "SHORT";
+  let entry, tp, sl;
+
+  if (direction === "LONG") {
+    entry = price;
+    sl    = parseFloat((entry * (1 - SL_PCT)).toFixed(8));
+    tp    = parseFloat((entry * (1 + TP_PCT)).toFixed(8));
+  } else {
+    entry = price;
+    sl    = parseFloat((entry * (1 + SL_PCT)).toFixed(8));
+    tp    = parseFloat((entry * (1 - TP_PCT)).toFixed(8));
+  }
+
+  const risk   = Math.abs(entry - sl);
+  const reward = Math.abs(tp - entry);
+  const rr     = (reward / risk).toFixed(1);
+
+  return { direction, entry, tp, sl, rr, slPct: SL_PCT * 100, tpPct: TP_PCT * 100 };
+}
 
 // ─── 發送市場總覽 ──────────────────────────────────────────
 async function sendOverview(channel) {
@@ -78,6 +115,7 @@ async function sendOverview(channel) {
 async function startMonitor(channel) {
   if (monitorInterval) clearInterval(monitorInterval);
   if (overviewInterval) clearInterval(overviewInterval);
+  mainChannel = channel;
 
   console.log(`🚀 開始監控 ${watchSymbols.length} 個交易對，每 30 分鐘發送總覽`);
 
@@ -91,7 +129,8 @@ async function startMonitor(channel) {
         if (absChange >= THRESHOLD) {
           const alreadyAlerted = prevPrice?.alerted && Date.now() - prevPrice.alertedAt < 3600000;
           if (!alreadyAlerted) {
-            await channel.send({ embeds: [buildAlertEmbed(ticker, THRESHOLD)] });
+            const signal = calcSignal(ticker.price, ticker.priceChange);
+            await channel.send({ embeds: [buildAlertEmbed(ticker, THRESHOLD, signal)] });
             lastPrices[ticker.symbol] = { price: ticker.price, alerted: true, alertedAt: Date.now() };
           }
         } else {
@@ -104,7 +143,6 @@ async function startMonitor(channel) {
     }
   }, INTERVAL);
 
-  // 每 30 分鐘自動發送市場總覽
   overviewInterval = setInterval(() => sendOverview(channel), OVERVIEW_INTERVAL);
 }
 
@@ -130,13 +168,30 @@ client.once(Events.ClientReady, async (c) => {
     }
   }
 
+  // 嘗試多種方式取得頻道
   try {
     const channel = await c.channels.fetch(CHANNEL_ID);
     console.log("✅ 頻道找到:", channel.name);
     await startMonitor(channel);
-    await sendOverview(channel); // 啟動時立即發一次
+    await sendOverview(channel);
   } catch (err) {
     console.error("❌ 頻道錯誤:", err.message);
+    console.log("嘗試從所有伺服器尋找頻道...");
+    let found = false;
+    for (const guild of c.guilds.cache.values()) {
+      try {
+        const g = await guild.fetch();
+        const ch = await g.channels.fetch(CHANNEL_ID).catch(() => null);
+        if (ch) {
+          console.log(`✅ 在伺服器 ${g.name} 找到頻道: ${ch.name}`);
+          await startMonitor(ch);
+          await sendOverview(ch);
+          found = true;
+          break;
+        }
+      } catch (e) {}
+    }
+    if (!found) console.error("❌ 所有伺服器都找不到頻道，請確認 DISCORD_CHANNEL_ID");
   }
 });
 
@@ -150,7 +205,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       case "price": {
         const sym = interaction.options.getString("symbol").toUpperCase();
         const ticker = await api.getTicker(sym);
-        await interaction.editReply({ embeds: [buildTickerEmbed(ticker)] });
+        const signal = calcSignal(ticker.price, ticker.priceChange);
+        await interaction.editReply({ embeds: [buildTickerEmbed(ticker), buildSignalEmbed(ticker, signal)] });
+        break;
+      }
+      case "signal": {
+        const sym = interaction.options.getString("symbol").toUpperCase();
+        const ticker = await api.getTicker(sym);
+        const signal = calcSignal(ticker.price, ticker.priceChange);
+        await interaction.editReply({ embeds: [buildSignalEmbed(ticker, signal)] });
         break;
       }
       case "market": {
@@ -164,10 +227,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const input = interaction.options.getString("symbols");
         watchSymbols = input.split(",").map((s) => s.trim().toUpperCase());
         lastPrices = {};
-        const channel = interaction.channel;
-        await startMonitor(channel);
+        await startMonitor(interaction.channel);
         await interaction.editReply(
-          `✅ 已設定監控：**${watchSymbols.join(", ")}**\n每 ${INTERVAL / 1000} 秒掃描，漲跌超過 ${THRESHOLD}% 自動警報，每 30 分鐘發送市場總覽`
+          `✅ 已設定監控：**${watchSymbols.join(", ")}**\n每 ${INTERVAL / 1000} 秒掃描，漲跌超過 ${THRESHOLD}% 自動警報 + TP/SL，每 30 分鐘發送市場總覽`
         );
         break;
       }
@@ -178,6 +240,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           `• 監控標的：${watchSymbols.length > 0 ? watchSymbols.join(", ") : "無"}\n` +
           `• 掃描間隔：${INTERVAL / 1000} 秒\n` +
           `• 警報閾值：±${THRESHOLD}%\n` +
+          `• 止損：${SL_PCT * 100}%　止盈：${TP_PCT * 100}%　風報比：1:2\n` +
           `• 市場總覽：每 30 分鐘自動發送\n` +
           `• 監控中：${monitorInterval ? "✅ 是" : "❌ 否"}`
         );
@@ -187,9 +250,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const limit = interaction.options.getInteger("limit") || 20;
         watchSymbols = await api.getTopSymbols(limit);
         lastPrices = {};
-        const channel = interaction.channel;
-        await startMonitor(channel);
-        await sendOverview(channel);
+        await startMonitor(interaction.channel);
+        await sendOverview(interaction.channel);
         await interaction.editReply(
           `✅ 偵測並監控 **${watchSymbols.length}** 個交易對，每 30 分鐘自動發送市場總覽`
         );
