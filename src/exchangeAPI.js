@@ -82,10 +82,18 @@ const OKXAPI = {
     const res = await axios.get(
       `${this.baseURL}/api/v5/market/tickers?instType=SPOT`
     );
-    return res.data.data
+    // 先取前20大成交量，再依漲幅由高到低排序
+    const top20ByVolume = res.data.data
       .filter((t) => t.instId.endsWith("-USDT"))
       .sort((a, b) => parseFloat(b.volCcy24h) - parseFloat(a.volCcy24h))
-      .slice(0, limit)
+      .slice(0, limit);
+
+    return top20ByVolume
+      .sort((a, b) => {
+        const changeA = ((parseFloat(a.last) - parseFloat(a.open24h)) / parseFloat(a.open24h)) * 100;
+        const changeB = ((parseFloat(b.last) - parseFloat(b.open24h)) / parseFloat(b.open24h)) * 100;
+        return changeB - changeA; // 漲幅高的排前面
+      })
       .map((t) => t.instId.replace("-", "/"));
   },
 
