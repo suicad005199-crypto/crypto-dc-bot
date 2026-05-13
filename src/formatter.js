@@ -1,234 +1,108 @@
-const {
-  EmbedBuilder,
-  Colors,
-} = require("discord.js");
+// src/formatter.js
+// Discord Embed 格式化模組
 
-/* ---------------------------------- */
-/* Utils */
-/* ---------------------------------- */
+const { EmbedBuilder } = require("discord.js");
 
-const COLORS = {
-  long: Colors.Green,
-  short: Colors.Red,
-  neutral: Colors.Blurple,
-  warning: Colors.Orange,
-  muted: Colors.Grey,
+// 類型對應 emoji 和顏色
+const TYPE_META = {
+  L1:     { emoji: "🔵", label: "Layer 1 主鏈",    color: 0x3b82f6 },
+  L2:     { emoji: "🟣", label: "Layer 2 擴容",    color: 0x8b5cf6 },
+  DEFI:   { emoji: "🟢", label: "DeFi 協議",       color: 0x10b981 },
+  MEME:   { emoji: "🐸", label: "Meme 幣",         color: 0xf59e0b },
+  AI:     { emoji: "🤖", label: "AI 概念",         color: 0x06b6d4 },
+  GAMEFI: { emoji: "🎮", label: "GameFi / NFT",   color: 0xf97316 },
+  STABLE: { emoji: "💵", label: "穩定幣",          color: 0x6b7280 },
+  ALT:    { emoji: "⚪", label: "山寨幣",          color: 0x9ca3af },
 };
 
-function safeNumber(value, fallback = 0) {
-  const num = Number(value);
-  return Number.isFinite(num) ? num : fallback;
+function formatPrice(price) {
+  if (price >= 1000) return price.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  if (price >= 1)    return price.toFixed(4);
+  if (price >= 0.01) return price.toFixed(6);
+  return price.toFixed(8);
 }
 
-function formatPrice(price) {
-  const value = safeNumber(price);
+function formatVolume(vol) {
+  if (vol >= 1e9) return `$${(vol / 1e9).toFixed(2)}B`;
+  if (vol >= 1e6) return `$${(vol / 1e6).toFixed(2)}M`;
+  if (vol >= 1e3) return `$${(vol / 1e3).toFixed(2)}K`;
+  return `$${vol.toFixed(2)}`;
+}
 
-  if (value >= 1000) {
-    return value.toLocaleString("en-US", {
-      maximumFractionDigits: 2,
+// ─── 單一交易對 Embed ──────────────────────────────────────
+function buildTickerEmbed(ticker) {
+  const meta = TYPE_META[ticker.type] || TYPE_META.ALT;
+  const isUp = ticker.priceChange >= 0;
+  const changeStr = `${isUp ? "▲" : "▼"} ${Math.abs(ticker.priceChange).toFixed(2)}%`;
+  const color = isUp ? 0x22c55e : 0xef4444;
+
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle(`${meta.emoji} ${ticker.symbol}  ${changeStr}`)
+    .setDescription(
+      `**交易標的類型：** ${meta.label}\n` +
+      `**交易所：** ${ticker.exchange}`
+    )
+    .addFields(
+      { name: "💰 當前價格",  value: `\`$${formatPrice(ticker.price)}\``,          inline: true },
+      { name: "📈 24h 最高",  value: `\`$${formatPrice(ticker.high24h)}\``,        inline: true },
+      { name: "📉 24h 最低",  value: `\`$${formatPrice(ticker.low24h)}\``,         inline: true },
+      { name: "📊 24h 成交額", value: formatVolume(ticker.quoteVolume24h),          inline: true },
+      { name: "🪙 基礎資產",  value: ticker.baseAsset,                             inline: true },
+      { name: "💱 計價資產",  value: ticker.quoteAsset,                            inline: true },
+    )
+    .setFooter({ text: `${ticker.exchange} · 更新時間` })
+    .setTimestamp(ticker.timestamp);
+}
+
+// ─── 多標的總覽 Embed ──────────────────────────────────────
+function buildOverviewEmbed(tickers, exchange) {
+  const embed = new EmbedBuilder()
+    .setColor(0x6366f1)
+    .setTitle(`📡 ${exchange} 市場總覽 — 前 ${tickers.length} 大交易對`)
+    .setTimestamp();
+
+  // 依類型分組
+  const groups = {};
+  tickers.forEach((t) => {
+    if (!groups[t.type]) groups[t.type] = [];
+    groups[t.type].push(t);
+  });
+
+  for (const [type, list] of Object.entries(groups)) {
+    const meta = TYPE_META[type] || TYPE_META.ALT;
+    const lines = list.map((t) => {
+      const isUp = t.priceChange >= 0;
+      const arrow = isUp ? "▲" : "▼";
+      return `${arrow} **${t.baseAsset}** $${formatPrice(t.price)} (${isUp ? "+" : ""}${t.priceChange.toFixed(2)}%)`;
+    });
+    embed.addFields({
+      name: `${meta.emoji} ${meta.label}`,
+      value: lines.join("\n"),
+      inline: false,
     });
   }
 
-  if (value >= 1) return value.toFixed(4);
-  if (value >= 0.01) return value.toFixed(6);
-
-  return value.toFixed(8);
+  return embed;
 }
 
-function formatPercent(value) {
-  const num = safeNumber(value);
-  return `${num >= 0 ? "+" : ""}${num.toFixed(2)}%`;
-}
+// ─── 警報 Embed ────────────────────────────────────────────
+function buildAlertEmbed(ticker, threshold) {
+  const isUp = ticker.priceChange >= 0;
+  const meta = TYPE_META[ticker.type] || TYPE_META.ALT;
+  const color = isUp ? 0x22c55e : 0xef4444;
+  const direction = isUp ? "🚀 急漲警報" : "🔻 急跌警報";
 
-function formatVolume(value) {
-  const volume = safeNumber(value);
-
-  if (volume >= 1e9) return `$${(volume / 1e9).toFixed(2)}B`;
-  if (volume >= 1e6) return `$${(volume / 1e6).toFixed(2)}M`;
-  if (volume >= 1e3) return `$${(volume / 1e3).toFixed(2)}K`;
-
-  return `$${volume.toFixed(2)}`;
-}
-
-function getDirectionColor(isLong) {
-  return isLong ? COLORS.long : COLORS.short;
-}
-
-function createBaseEmbed(color) {
   return new EmbedBuilder()
     .setColor(color)
+    .setTitle(`${direction}！${ticker.symbol}`)
+    .setDescription(
+      `**${meta.emoji} ${meta.label}** 在 24h 內波動超過 **${threshold}%**\n\n` +
+      `📌 當前價格：**$${formatPrice(ticker.price)}**\n` +
+      `📈 24h 漲跌：**${ticker.priceChange >= 0 ? "+" : ""}${ticker.priceChange.toFixed(2)}%**`
+    )
+    .setFooter({ text: `來源：${ticker.exchange}` })
     .setTimestamp();
 }
 
-function formatMomentum(value) {
-  return `${safeNumber(value).toFixed(2)}%`;
-}
-
-function buildField(name, value, inline = true) {
-  return {
-    name,
-    value: String(value),
-    inline,
-  };
-}
-
-/* ---------------------------------- */
-/* Ticker Embed */
-/* ---------------------------------- */
-
-function buildTickerEmbed(ticker) {
-  const isLong = safeNumber(ticker.priceChange) >= 0;
-
-  return createBaseEmbed(getDirectionColor(isLong))
-    .setTitle(
-      `${ticker.symbol} ${
-        isLong ? "LONG 偏強 📈" : "SHORT 偏弱 📉"
-      }`
-    )
-    .addFields(
-      buildField("交易所", ticker.exchange),
-      buildField("現價", `$${formatPrice(ticker.price)}`),
-      buildField("24h 漲跌", formatPercent(ticker.priceChange)),
-
-      buildField(
-        "24h 高 / 低",
-        `$${formatPrice(ticker.high24h)} / $${formatPrice(
-          ticker.low24h
-        )}`,
-        false
-      ),
-
-      buildField(
-        "24h 成交額",
-        formatVolume(ticker.quoteVolume24h),
-        false
-      )
-    )
-    .setFooter({
-      text: "Market Data • Futures Monitor",
-    });
-}
-
-/* ---------------------------------- */
-/* Market Overview */
-/* ---------------------------------- */
-
-function buildOverviewEmbed(tickers, exchange) {
-  const description =
-    tickers.length > 0
-      ? tickers
-          .slice(0, 15)
-          .map((ticker, index) => {
-            return [
-              `**${index + 1}. ${ticker.symbol}**`,
-              `💰 $${formatPrice(ticker.price)}`,
-              `📊 ${formatPercent(ticker.priceChange)}`,
-            ].join(" ");
-          })
-          .join("\n")
-      : "目前沒有市場資料";
-
-  return createBaseEmbed(COLORS.neutral)
-    .setTitle(`${exchange} 市場總覽`)
-    .setDescription(description)
-    .setFooter({
-      text: `Top ${Math.min(tickers.length, 15)} Contracts`,
-    });
-}
-
-/* ---------------------------------- */
-/* Signal Embed */
-/* ---------------------------------- */
-
-function buildSignalEmbed(signal) {
-  const isLong = signal.direction === "LONG";
-
-  const reasons = Array.isArray(signal.reasons)
-    ? signal.reasons.map((x) => `• ${x}`).join("\n")
-    : "無";
-
-  return createBaseEmbed(getDirectionColor(isLong))
-    .setTitle(
-      `${signal.direction} 訊號 ${
-        isLong ? "🚀" : "⚠️"
-      } | ${signal.symbol}`
-    )
-    .setDescription(
-      [
-        `🎯 信心分數: **${signal.confidence}**`,
-        `🏢 交易所: **${signal.exchange}**`,
-        `⏱️ 結構: **${signal.higherTimeframe || "1h"} → ${
-          signal.lowerTimeframe || "15m"
-        }**`,
-        "",
-        `📌 理由`,
-        reasons,
-      ].join("\n")
-    )
-    .addFields(
-      buildField("Entry", `$${formatPrice(signal.entry)}`),
-      buildField("TP1", `$${formatPrice(signal.takeProfit1)}`),
-      buildField("TP2", `$${formatPrice(signal.takeProfit2)}`),
-
-      buildField("SL", `$${formatPrice(signal.stopLoss)}`),
-      buildField("RR", `${signal.riskReward}R`),
-      buildField("RSI", safeNumber(signal.rsi).toFixed(2)),
-
-      buildField("ATR", formatPrice(signal.atr)),
-      buildField("M15 動能", formatMomentum(signal.momentum)),
-      buildField(
-        "H1 動能",
-        formatMomentum(signal.higherTimeframeMomentum)
-      ),
-
-      buildField(
-        "量能倍率",
-        `${safeNumber(signal.volumeRatio).toFixed(2)}x`
-      )
-    )
-    .setFooter({
-      text: "Signal Alert • Not Financial Advice",
-    });
-}
-
-/* ---------------------------------- */
-/* Signal List Embed */
-/* ---------------------------------- */
-
-function buildSignalListEmbed(signals, exchange) {
-  if (!signals.length) {
-    return createBaseEmbed(COLORS.muted)
-      .setTitle(`${exchange} 策略掃描`)
-      .setDescription("目前沒有達標訊號")
-      .setFooter({
-        text: "Scanner Idle",
-      });
-  }
-
-  const description = signals
-    .map((signal, index) => {
-      return [
-        `## ${index + 1}. ${signal.direction} ${signal.symbol}`,
-        `🎯 Score: **${signal.confidence}** | RR: **${signal.riskReward}R**`,
-        `📊 H1 ${formatMomentum(signal.higherTimeframeMomentum)} / M15 ${formatMomentum(signal.momentum)}`,
-        `💰 Entry: $${formatPrice(signal.entry)}`,
-        `🎯 TP1: $${formatPrice(signal.takeProfit1)}`,
-        `🛑 SL: $${formatPrice(signal.stopLoss)}`,
-      ].join("\n");
-    })
-    .join("\n\n");
-
-  return createBaseEmbed(COLORS.warning)
-    .setTitle(`${exchange} 策略掃描`)
-    .setDescription(description)
-    .setFooter({
-      text: `${signals.length} Signals Detected`,
-    });
-}
-
-module.exports = {
-  buildTickerEmbed,
-  buildOverviewEmbed,
-  buildSignalEmbed,
-  buildSignalListEmbed,
-};
+module.exports = { buildTickerEmbed, buildOverviewEmbed, buildAlertEmbed, TYPE_META };
